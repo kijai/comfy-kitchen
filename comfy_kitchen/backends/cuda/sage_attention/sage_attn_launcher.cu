@@ -22,7 +22,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  int stride_seq_k, int stride_h_k, int stride_bz_v,
                  int stride_h_v, int stride_d_v, int stride_bz_o,
                  int stride_seq_o, int stride_h_o, float sm_scale,
-                 int batch_size, cudaStream_t stream) {
+                 int batch_size, bool pv_fp16, bool qk_per_warp,
+                 cudaStream_t stream) {
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   constexpr int CTA_Q = 128;
   constexpr int CTA_K = 64;
@@ -35,22 +36,43 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                                    CTA_K * HEAD_DIM * sizeof(int8_t)),
                static_cast<size_t>(CTA_Q * HEAD_DIM * sizeof(half)));
 
-  auto kernel = qk_int_sv_f8_attn_kernel<
-      CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
-      QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
-      DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false>;
-
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       smem_max);
-
   dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
-  kernel<<<grid, block, smem_max, stream>>>(
-      q, k, v, o, nullptr, q_scale, k_scale, v_scale, nullptr, qo_len, kv_len,
-      num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
-      stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
-      stride_bz_o, stride_seq_o, stride_h_o, sm_scale);
+  auto launch = [&](auto kernel) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_max);
+    kernel<<<grid, block, smem_max, stream>>>(
+        q, k, v, o, nullptr, q_scale, k_scale, v_scale, nullptr, qo_len, kv_len,
+        num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
+        stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
+        stride_bz_o, stride_seq_o, stride_h_o, sm_scale);
+  };
+
+  // pv_fp16: accumulate the P@V matmul with fp16 (mma f8f8f16, ~2x rate on
+  // sm89; SageAttention2++). Requires V quantized to the small +-2.25 e4m3 range
+  // (handled in the V quant launch) so the running PV sum stays inside fp16.
+  // Otherwise use plain fp32 accumulation with the full +-448 V range.
+  // qk_per_warp: per-warp INT8 Q/K quant granularity (upstream's sm120 choice);
+  // otherwise per-thread (sm89 default). Both Q and K use the same granularity.
+#define SAGE_LAUNCH(QGRAN, INST_BUF, PV16)                                     \
+  launch(qk_int_sv_f8_attn_kernel<                                            \
+         CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,             \
+         QuantGranularity::QGRAN, QuantGranularity::QGRAN, float, INST_BUF,   \
+         DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, PV16>)
+
+  if (qk_per_warp) {
+    if (pv_fp16)
+      SAGE_LAUNCH(kPerWarp, true, true);
+    else
+      SAGE_LAUNCH(kPerWarp, false, false);
+  } else {
+    if (pv_fp16)
+      SAGE_LAUNCH(kPerThread, true, true);
+    else
+      SAGE_LAUNCH(kPerThread, false, false);
+  }
+#undef SAGE_LAUNCH
 }
 
 } // anonymous namespace
@@ -62,8 +84,11 @@ extern "C" void launch_sage_attn_kernel(
     int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
-    int is_causal, float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    int is_causal, float sm_scale, int output_dtype_code, int pv_fp16_accum,
+    int qk_per_warp_gran, cudaStream_t stream) {
   int num_kv_groups = num_qo_heads / num_kv_heads;
+  const bool pv_fp16 = pv_fp16_accum != 0;
+  const bool qk_per_warp = qk_per_warp_gran != 0;
 
   // Upstream kernel uses non-const pointers; cast away const from the
   // extern "C" boundary (kernel does not modify inputs).
@@ -80,7 +105,7 @@ extern "C" void launch_sage_attn_kernel(
                           stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,  \
                           stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,   \
                           stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,   \
-                          sm_scale, batch_size, stream)
+                          sm_scale, batch_size, pv_fp16, qk_per_warp, stream)
 
 #define DISPATCH_DTYPE(HD, MM)                                                 \
   if (output_dtype_code == 1) {                                                \

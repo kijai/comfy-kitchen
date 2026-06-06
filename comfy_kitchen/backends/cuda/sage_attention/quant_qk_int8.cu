@@ -469,6 +469,67 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-warp INT8 quant (kPerWarp granularity, used by upstream SageAttention on
+// sm120/Blackwell). One scale per WARP_ROWS-row block = max-abs over those rows
+// and all channels. Scale layout matches the kernel's kPerWarp indexing:
+// sc_buf[(b*H + h)*num_wb + g] for warp-row-block g. `km` (optional) is the
+// per-channel K-mean subtracted for smooth-k.
+// ---------------------------------------------------------------------------
+template <typename T, int WARP_ROWS>
+__global__ __launch_bounds__(256) void quant_per_warp_kernel(
+    const T *__restrict__ in, int8_t *__restrict__ out,
+    float *__restrict__ sc_buf, const float *__restrict__ km, int L, int C,
+    int H, int num_wb) {
+  const int g = blockIdx.x;
+  const int h = blockIdx.y, b = blockIdx.z;
+  const int row0 = g * WARP_ROWS;
+  const int64_t bh = ((int64_t)b * H + h) * (int64_t)L * C;
+  const float *km_bh = km ? km + ((int64_t)b * H + h) * C : nullptr;
+  const int tid = threadIdx.x;
+  const int total = WARP_ROWS * C;
+
+  float mx = 0.f;
+  for (int idx = tid; idx < total; idx += 256) {
+    const int n = row0 + idx / C;
+    if (n < L) {
+      float val = static_cast<float>(in[bh + (int64_t)n * C + (idx % C)]);
+      if (km_bh)
+        val -= km_bh[idx % C];
+      mx = fmaxf(mx, fabsf(val));
+    }
+  }
+
+  // block-wide max reduction (256 threads = 8 warps)
+  __shared__ float smem[8];
+  mx = warp_reduce_fmax(mx);
+  if ((tid & 31) == 0)
+    smem[tid >> 5] = mx;
+  __syncthreads();
+  if (tid == 0) {
+    float v = smem[0];
+#pragma unroll
+    for (int i = 1; i < 8; i++)
+      v = fmaxf(v, smem[i]);
+    smem[0] = v;
+  }
+  __syncthreads();
+  const float sc = smem[0] / 127.f + 1e-7f;
+  if (tid == 0)
+    sc_buf[((int64_t)b * H + h) * num_wb + g] = sc;
+
+  for (int idx = tid; idx < total; idx += 256) {
+    const int n = row0 + idx / C;
+    if (n < L) {
+      const int64_t off = bh + (int64_t)n * C + (idx % C);
+      float val = static_cast<float>(in[off]);
+      if (km_bh)
+        val -= km_bh[idx % C];
+      out[off] = quant_int8(val, sc);
+    }
+  }
+}
+
 } // namespace
 
 // smooth_k == 1 → compute km into km_scratch, pass to quant_k_kernel.
@@ -579,4 +640,48 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #undef LAUNCH_FUSED
 #undef DISPATCH_TILES
 #undef DO
+}
+
+// Per-warp INT8 quant for Q and K (kPerWarp granularity). Q uses WARPQ rows per
+// scale (16 for head_dim 256, else 32), K uses WARPK=64. smooth_k reuses the
+// same k_mean_reduce as the per-thread path.
+extern "C" void launch_quant_qk_per_warp_int8(
+    const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
+    void *k_scale, int smooth_k, void *km_scratch, void *km_done, int B,
+    int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ, int WARPQ, int BLKK,
+    int WARPK, int input_dtype_code, cudaStream_t stream) {
+  const int num_wb_q = (Lq + BLKQ - 1) / BLKQ * (BLKQ / WARPQ);
+  const int num_wb_k = (Lk + BLKK - 1) / BLKK * (BLKK / WARPK);
+
+  float *km_ptr = nullptr;
+  if (smooth_k && km_scratch && km_done) {
+    const int mean_blks = (Lk + MEAN_ROWS_PER_BLK - 1) / MEAN_ROWS_PER_BLK;
+    const float inv_Lk = 1.f / static_cast<float>(Lk);
+    cudaMemsetAsync(km_scratch, 0, (size_t)B * H_kv * C * sizeof(float), stream);
+    cudaMemsetAsync(km_done, 0, (size_t)B * H_kv * sizeof(int), stream);
+    dim3 gm(mean_blks, H_kv, B);
+    DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+      k_mean_reduce<T><<<gm, MEAN_BLK_DIM, 0, stream>>>(
+          (const T *)k, (float *)km_scratch, (int *)km_done, Lk, C, H_kv,
+          mean_blks, inv_Lk);
+    });
+    km_ptr = (float *)km_scratch;
+  }
+
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    dim3 gq(num_wb_q, H_q, B);
+    if (WARPQ == 16) {
+      quant_per_warp_kernel<T, 16><<<gq, 256, 0, stream>>>(
+          (const T *)q, (int8_t *)q_int8, (float *)q_scale, nullptr, Lq, C, H_q,
+          num_wb_q);
+    } else {
+      quant_per_warp_kernel<T, 32><<<gq, 256, 0, stream>>>(
+          (const T *)q, (int8_t *)q_int8, (float *)q_scale, nullptr, Lq, C, H_q,
+          num_wb_q);
+    }
+    dim3 gk(num_wb_k, H_kv, B);
+    quant_per_warp_kernel<T, 64><<<gk, 256, 0, stream>>>(
+        (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, Lk, C, H_kv,
+        num_wb_k);
+  });
 }

@@ -150,11 +150,19 @@ extern "C" {
         int BLKQ, int WARPQ, int BLKK, int WARPK,
         int input_dtype_code, cudaStream_t stream);
 
+    void launch_quant_qk_per_warp_int8(
+        const void* q, void* q_int8, void* q_scale,
+        const void* k, void* k_int8, void* k_scale,
+        int smooth_k, void* km_scratch, void* km_done,
+        int B, int H_q, int Lq, int H_kv, int Lk, int C,
+        int BLKQ, int WARPQ, int BLKK, int WARPK,
+        int input_dtype_code, cudaStream_t stream);
+
     void launch_quant_v_fp8_kernel(
         const void* v, void* out, void* scale,
         int B, int H, int N, int D, int padded_N,
         int64_t sb, int64_t sh, int64_t sn,
-        int input_dtype_code, cudaStream_t stream);
+        int input_dtype_code, float v_scale_max, cudaStream_t stream);
 
     void launch_sage_attn_kernel(
         const void* q, const void* k, const void* v, void* o,
@@ -165,7 +173,7 @@ extern "C" {
         int v_st_bz, int v_st_h, int v_st_d,
         int o_st_bz, int o_st_n, int o_st_h,
         int is_causal, float sm_scale, int output_dtype_code,
-        cudaStream_t stream);
+        int pv_fp16_accum, int qk_per_warp_gran, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
@@ -626,7 +634,7 @@ void quant_v_fp8(
         static_cast<int>(v.shape(3)),
         padded_n,
         v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, stream);
+        input_dtype_code, /*v_scale_max=*/448.0f, stream);
 }
 
 // Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
@@ -714,7 +722,7 @@ void sage_attn(
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(2), o.stride(1),
         is_causal, sm_scale, output_dtype_code,
-        stream);
+        /*pv_fp16_accum=*/0, /*qk_per_warp_gran=*/0, stream);
 }
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
@@ -739,7 +747,9 @@ void sage_sdpa(
     uintptr_t stream_ptr,
     int smooth_k = 0,
     uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0)
+    uintptr_t km_done_ptr = 0,
+    int pv_fp16_accum = 1,
+    int qk_quant_gran = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
@@ -766,21 +776,39 @@ void sage_sdpa(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    launch_quant_qk_per_thread_int8(
-        q.data(), q_int8.data(), q_scale.data(),
-        k.data(), k_int8.data(), k_scale.data(),
-        smooth_k,
-        reinterpret_cast<void *>(km_scratch_ptr),
-        reinterpret_cast<void *>(km_done_ptr),
-        B, H_q, Lq, H_kv, Lk, D,
-        BLKQ, WARPQ, BLKK, WARPK,
-        input_dtype_code, stream);
+    // qk_quant_gran: 0 = per-thread (sm89 default), 1 = per-warp (upstream's
+    // sm120/Blackwell choice). Caller must size q_scale/k_scale to match.
+    if (qk_quant_gran == 1) {
+        launch_quant_qk_per_warp_int8(
+            q.data(), q_int8.data(), q_scale.data(),
+            k.data(), k_int8.data(), k_scale.data(),
+            smooth_k,
+            reinterpret_cast<void *>(km_scratch_ptr),
+            reinterpret_cast<void *>(km_done_ptr),
+            B, H_q, Lq, H_kv, Lk, D,
+            BLKQ, WARPQ, BLKK, WARPK,
+            input_dtype_code, stream);
+    } else {
+        launch_quant_qk_per_thread_int8(
+            q.data(), q_int8.data(), q_scale.data(),
+            k.data(), k_int8.data(), k_scale.data(),
+            smooth_k,
+            reinterpret_cast<void *>(km_scratch_ptr),
+            reinterpret_cast<void *>(km_done_ptr),
+            B, H_q, Lq, H_kv, Lk, D,
+            BLKQ, WARPQ, BLKK, WARPK,
+            input_dtype_code, stream);
+    }
+
+    // fp16 PV accumulation needs V in the small +-2.25 e4m3 range; fp32 uses the
+    // full +-448 range for max precision. Must match the kernel selection below.
+    const float v_scale_max = pv_fp16_accum ? 2.25f : 448.0f;
 
     launch_quant_v_fp8_kernel(
         v.data(), v_quant.data(), v_scale.data(),
         B, H_kv, Lk, D, padded_Lk,
         v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, stream);
+        input_dtype_code, v_scale_max, stream);
 
     // int64_t arithmetic to detect overflow before narrowing to int.
     const int64_t qi_st_bz64 = static_cast<int64_t>(H_q)  * Lq * D;
@@ -810,7 +838,7 @@ void sage_sdpa(
         v_st_bz, v_st_h, v_st_d,
         o_st_bz, o_st_n, o_st_h,
         is_causal, sm_scale, output_dtype_code,
-        stream);
+        pv_fp16_accum, qk_quant_gran, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1078,7 +1106,9 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"),
           nb::arg("smooth_k") = 0,
           nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0);
+          nb::arg("km_done_ptr") = 0,
+          nb::arg("pv_fp16_accum") = 1,
+          nb::arg("qk_quant_gran") = 0);
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "

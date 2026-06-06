@@ -62,7 +62,8 @@ template <typename T>
 __global__ void
 quant_v_fp8_kernel(const T *__restrict__ v, __nv_fp8_e4m3 *__restrict__ out,
                    float *__restrict__ scale_out, int N, int padded_N, int H,
-                   int D, int64_t sb, int64_t sh, int64_t sn) {
+                   int D, int64_t sb, int64_t sh, int64_t sn,
+                   float inv_scale_max) {
   const int d_tiles = D / kDTile;
   const int d_tile = blockIdx.x % d_tiles;
   const int bh = blockIdx.x / d_tiles;
@@ -129,8 +130,7 @@ quant_v_fp8_kernel(const T *__restrict__ v, __nv_fp8_e4m3 *__restrict__ out,
     for (int w = 0; w < kWarps; ++w)
       val = fmaxf(val, warp_mx[threadIdx.x][w]);
 
-    float sc =
-        fmaxf(val * comfy::FP8LimitsTrait<__nv_fp8_e4m3>::max_inverse, 1e-12f);
+    float sc = fmaxf(val * inv_scale_max, 1e-12f);
     scale_out[(b * H + h) * D + d0 + threadIdx.x] = sc;
     inv_sc_sh[threadIdx.x] = 1.f / sc;
   }
@@ -180,12 +180,19 @@ extern "C" void launch_quant_v_fp8_kernel(const void *v, void *out, void *scale,
                                           int B, int H, int N, int D,
                                           int padded_N, int64_t sb, int64_t sh,
                                           int64_t sn, int input_dtype_code,
+                                          float v_scale_max,
                                           cudaStream_t stream) {
   const int blocks = B * H * (D / kDTile);
+  // V is quantized so its per-channel max maps to v_scale_max in e4m3. The full
+  // e4m3 range (448) maximizes precision for fp32 PV accumulation; the fp16
+  // accumulation path needs a small range (2.25) to keep the running PV sum
+  // inside fp16 (matches upstream SageAttention2++).
+  const float inv_scale_max = 1.0f / v_scale_max;
 
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     quant_v_fp8_kernel<T><<<blocks, kThreads, 0, stream>>>(
         static_cast<const T *>(v), static_cast<__nv_fp8_e4m3 *>(out),
-        static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
+        static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn,
+        inv_scale_max);
   });
 }

@@ -113,6 +113,8 @@ def sage_sdpa(
     v: torch.Tensor,
     is_causal: bool = False,
     smooth_k: bool = True,
+    pv_fp16_accum: bool = True,
+    qk_quant_gran: int | None = None,
 ) -> torch.Tensor:
     """SageAttention scaled dot-product attention.
 
@@ -123,6 +125,13 @@ def sage_sdpa(
     v : Tensor [B, H_K, N_K, D]   (same dtype as q)
     is_causal : bool
     smooth_k : bool  — subtract per-head K mean before quantisation
+    pv_fp16_accum : bool  — accumulate the P@V matmul in fp16 (SageAttention2++,
+        ~15% faster on sm89; V is quantised to a small range to stay in fp16
+        range). Set False for fp32 accumulation (full-range V, marginally more
+        accurate) if a model shows numerical issues.
+    qk_quant_gran : int | None  — INT8 Q/K quant granularity: 0 = per-thread,
+        1 = per-warp. None (default) auto-selects per upstream SageAttention:
+        per-warp on sm120 (Blackwell), per-thread on sm89/sm90.
 
     Returns
     -------
@@ -140,24 +149,34 @@ def sage_sdpa(
     if h_q % h_k != 0:
         raise ValueError(f"num_qo_heads ({h_q}) must be divisible by num_kv_heads ({h_k})")
 
+    # QK quant granularity: match upstream SageAttention's arch dispatch — per-warp
+    # on sm120 (Blackwell), per-thread on sm89/sm90 (Ada/Hopper). Explicit caller
+    # value overrides the auto-detection.
+    if qk_quant_gran is None:
+        qk_quant_gran = 1 if torch.cuda.get_device_capability(q.device) == (12, 0) else 0
+
     # Tiling parameters — must match sage_attn_launcher.cu and dlpack_bindings.cpp.
     # head_dim 256 uses WARP_Q=16 (smaller per-thread accumulator, no spilling).
     blkq, warpq, blkk, warpk = 128, (16 if d == 256 else 32), 64, 64
     padded_n_k = _pad_to_cta_k(n_k)
+
+    # Scales per warp-block: per-thread quant emits 8 (Q) / 4 (K); per-warp emits 1.
+    q_sc_mult = 1 if qk_quant_gran == 1 else 8
+    k_sc_mult = 1 if qk_quant_gran == 1 else 4
 
     q_int8 = torch.empty_like(q, dtype=torch.int8)
     k_int8 = torch.empty_like(k, dtype=torch.int8)
     q_scale = torch.empty(
         b,
         h_q,
-        ((n_q + blkq - 1) // blkq) * (blkq // warpq) * 8,
+        ((n_q + blkq - 1) // blkq) * (blkq // warpq) * q_sc_mult,
         device=q.device,
         dtype=torch.float32,
     )
     k_scale = torch.empty(
         b,
         h_k,
-        ((n_k + blkk - 1) // blkk) * (blkk // warpk) * 4,
+        ((n_k + blkk - 1) // blkk) * (blkk // warpk) * k_sc_mult,
         device=q.device,
         dtype=torch.float32,
     )
@@ -208,6 +227,8 @@ def sage_sdpa(
         int(smooth_k),
         km_scratch_ptr,
         km_done_ptr,
+        int(pv_fp16_accum),
+        int(qk_quant_gran),
     )
     if original_dtype == torch.float32:
         return output.to(torch.float32)
