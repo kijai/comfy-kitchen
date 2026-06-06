@@ -135,13 +135,14 @@ def sage_sdpa(
     _, h_k, n_k, _ = k.shape
     if q.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"q.dtype must be float32, float16, or bfloat16, got {q.dtype}")
-    if d not in (64, 128):
-        raise ValueError(f"head_dim must be 64 or 128, got {d}")
+    if d not in (64, 128, 256):
+        raise ValueError(f"head_dim must be 64, 128, or 256, got {d}")
     if h_q % h_k != 0:
         raise ValueError(f"num_qo_heads ({h_q}) must be divisible by num_kv_heads ({h_k})")
 
     # Tiling parameters — must match sage_attn_launcher.cu and dlpack_bindings.cpp.
-    blkq, warpq, blkk, warpk = 128, 32, 64, 64
+    # head_dim 256 uses WARP_Q=16 (smaller per-thread accumulator, no spilling).
+    blkq, warpq, blkk, warpk = 128, (16 if d == 256 else 32), 64, 64
     padded_n_k = _pad_to_cta_k(n_k)
 
     q_int8 = torch.empty_like(q, dtype=torch.int8)

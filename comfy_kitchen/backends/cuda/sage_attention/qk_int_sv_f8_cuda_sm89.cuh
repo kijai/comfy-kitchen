@@ -98,6 +98,13 @@ __global__ void qk_int_sv_f8_attn_kernel(
                                               : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
 
+  // The return_lse store (near the end of this kernel) hardcodes the
+  // num_tiles_q == 2 fragment layout. head_dim 256 uses WARP_Q=16 →
+  // num_tiles_q == 1, so guard against silently producing wrong LSE there.
+  static_assert(!return_lse || num_tiles_q == 2,
+                "return_lse assumes num_tiles_q == 2 (WARP_Q=32); it is not "
+                "supported for the head_dim 256 / WARP_Q 16 tiling");
+
   constexpr uint32_t QK_SMEM_STRIDE =
       (DTypeQK == DataType::kInt8) ? (head_dim) : (head_dim / 2);
   constexpr uint32_t O_SMEM_STRIDE = head_dim;

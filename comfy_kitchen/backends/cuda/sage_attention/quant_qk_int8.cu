@@ -84,46 +84,44 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
   constexpr int NSUB = BLKQ / WARPQ;
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
-  const int ch = lane << 2;
+  // A warp covers 128 channels (32 lanes x 4). For head_dim > 128 we loop over
+  // 128-channel groups so the abs-max scale spans the whole head dimension and
+  // every channel is quantized. C is uniform across the block, so the loop
+  // count is uniform (no divergent loads). Two passes (max, then store) keep
+  // the register footprint independent of head_dim.
+  const int lane_ch = lane << 2;
 
 #pragma unroll
   for (int g = 0; g < 2; ++g) {
     const int otld = wid * 2 + g;
     const int base = (oblk / NSUB) * BLKQ + (oblk % NSUB) * WARPQ + otld;
 
-    float v[NR * 4];
+    // Pass 1: abs-max over every channel group.
     float mx = 0.f;
-
-    if (ALIGNED4 || ch + 3 < C) {
+    for (int cc = 0; cc < C; cc += 128) {
+      const int ch = cc + lane_ch;
+      if (ALIGNED4 || ch + 3 < C) {
 #pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        const int n = base + j * 8;
-        if (n < L) {
-          VectorLoader4<T>::load(&in[(int64_t)n * C + ch], &v[j * 4]);
-          mx =
-              fmaxf(mx, fmaxf(fmaxf(fabsf(v[j * 4]), fabsf(v[j * 4 + 1])),
-                              fmaxf(fabsf(v[j * 4 + 2]), fabsf(v[j * 4 + 3]))));
-        } else {
-          v[j * 4] = v[j * 4 + 1] = v[j * 4 + 2] = v[j * 4 + 3] = 0.f;
-        }
-      }
-    } else if (ch < C) {
-#pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        const int n = base + j * 8;
-        if (n < L) {
-#pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            v[j * 4 + c] =
-                (ch + c < C)
-                    ? static_cast<float>(__ldg(&in[(int64_t)n * C + ch + c]))
-                    : 0.f;
-            mx = fmaxf(mx, fabsf(v[j * 4 + c]));
+        for (int j = 0; j < NR; ++j) {
+          const int n = base + j * 8;
+          if (n < L) {
+            float v4[4];
+            VectorLoader4<T>::load(&in[(int64_t)n * C + ch], v4);
+            mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v4[0]), fabsf(v4[1])),
+                                 fmaxf(fabsf(v4[2]), fabsf(v4[3]))));
           }
-        } else {
+        }
+      } else if (ch < C) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c)
-            v[j * 4 + c] = 0.f;
+        for (int j = 0; j < NR; ++j) {
+          const int n = base + j * 8;
+          if (n < L) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+              if (ch + c < C)
+                mx = fmaxf(mx, fabsf(static_cast<float>(
+                                   __ldg(&in[(int64_t)n * C + ch + c]))));
+          }
         }
       }
     }
@@ -134,25 +132,31 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
     if (lane == 0)
       sc_buf[oblk * 8 + otld] = sc;
 
-    if (ALIGNED4 || ch + 3 < C) {
+    // Pass 2: quantize + store every channel group.
+    for (int cc = 0; cc < C; cc += 128) {
+      const int ch = cc + lane_ch;
+      if (ALIGNED4 || ch + 3 < C) {
 #pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        const int n = base + j * 8;
-        if (n < L) {
-          store4_i8(&out[(int64_t)n * C + ch], quant_int8(v[j * 4], sc),
-                    quant_int8(v[j * 4 + 1], sc), quant_int8(v[j * 4 + 2], sc),
-                    quant_int8(v[j * 4 + 3], sc));
+        for (int j = 0; j < NR; ++j) {
+          const int n = base + j * 8;
+          if (n < L) {
+            float v4[4];
+            VectorLoader4<T>::load(&in[(int64_t)n * C + ch], v4);
+            store4_i8(&out[(int64_t)n * C + ch], quant_int8(v4[0], sc),
+                      quant_int8(v4[1], sc), quant_int8(v4[2], sc),
+                      quant_int8(v4[3], sc));
+          }
         }
-      }
-    } else if (ch < C) {
+      } else if (ch < C) {
 #pragma unroll
-      for (int j = 0; j < NR; ++j) {
-        const int n = base + j * 8;
-        if (n < L) {
+        for (int j = 0; j < NR; ++j) {
+          const int n = base + j * 8;
+          if (n < L) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            if (ch + c < C)
-              out[(int64_t)n * C + ch + c] = quant_int8(v[j * 4 + c], sc);
+            for (int c = 0; c < 4; ++c)
+              if (ch + c < C)
+                out[(int64_t)n * C + ch + c] = quant_int8(
+                    static_cast<float>(__ldg(&in[(int64_t)n * C + ch + c])), sc);
           }
         }
       }
@@ -174,68 +178,59 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
           const float *__restrict__ km) {
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
-  const int ch = lane << 2;
+  // As in process_q, loop over 128-channel groups so head_dim > 128 is covered.
+  const int lane_ch = lane << 2;
   const int otld = wid;
 
-  float bias[4] = {0.f, 0.f, 0.f, 0.f};
-  if (km) {
-    if (ALIGNED4 || ch + 3 < C) {
-      float4 b4 = __ldg(reinterpret_cast<const float4 *>(&km[ch]));
-      bias[0] = b4.x;
-      bias[1] = b4.y;
-      bias[2] = b4.z;
-      bias[3] = b4.w;
-    } else if (ch < C) {
-#pragma unroll
-      for (int c = 0; c < 4; ++c)
-        bias[c] = (ch + c < C) ? __ldg(&km[ch + c]) : 0.f;
-    }
-  }
-
-  float v[2 * NL * 4];
+  // Pass 1: abs-max (after smooth-k bias subtraction) over every channel group.
   float mx = 0.f;
-
-  if (ALIGNED4 || ch + 3 < C) {
+  for (int cc = 0; cc < C; cc += 128) {
+    const int ch = cc + lane_ch;
+    float bias[4] = {0.f, 0.f, 0.f, 0.f};
+    if (km) {
+      if (ALIGNED4 || ch + 3 < C) {
+        float4 b4 = __ldg(reinterpret_cast<const float4 *>(&km[ch]));
+        bias[0] = b4.x;
+        bias[1] = b4.y;
+        bias[2] = b4.z;
+        bias[3] = b4.w;
+      } else if (ch < C) {
 #pragma unroll
-    for (int j = 0; j < NL; ++j) {
-#pragma unroll
-      for (int p = 0; p < 2; ++p) {
-        const int n = oblk * WARPK + j * 8 + otld * 2 + p;
-        const int vi = (j * 2 + p) * 4;
-        if (n < L) {
-          VectorLoader4<T>::load(&in[(int64_t)n * C + ch], &v[vi]);
-          v[vi] -= bias[0];
-          v[vi + 1] -= bias[1];
-          v[vi + 2] -= bias[2];
-          v[vi + 3] -= bias[3];
-          mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v[vi]), fabsf(v[vi + 1])),
-                               fmaxf(fabsf(v[vi + 2]), fabsf(v[vi + 3]))));
-        } else {
-          v[vi] = v[vi + 1] = v[vi + 2] = v[vi + 3] = 0.f;
-        }
+        for (int c = 0; c < 4; ++c)
+          bias[c] = (ch + c < C) ? __ldg(&km[ch + c]) : 0.f;
       }
     }
-  } else if (ch < C) {
+
+    if (ALIGNED4 || ch + 3 < C) {
 #pragma unroll
-    for (int j = 0; j < NL; ++j) {
+      for (int j = 0; j < NL; ++j) {
 #pragma unroll
-      for (int p = 0; p < 2; ++p) {
-        const int n = oblk * WARPK + j * 8 + otld * 2 + p;
-        const int vi = (j * 2 + p) * 4;
-        if (n < L) {
-#pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            v[vi + c] =
-                (ch + c < C)
-                    ? static_cast<float>(__ldg(&in[(int64_t)n * C + ch + c])) -
-                          bias[c]
-                    : 0.f;
-            mx = fmaxf(mx, fabsf(v[vi + c]));
+        for (int p = 0; p < 2; ++p) {
+          const int n = oblk * WARPK + j * 8 + otld * 2 + p;
+          if (n < L) {
+            float v4[4];
+            VectorLoader4<T>::load(&in[(int64_t)n * C + ch], v4);
+            mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v4[0] - bias[0]),
+                                       fabsf(v4[1] - bias[1])),
+                                 fmaxf(fabsf(v4[2] - bias[2]),
+                                       fabsf(v4[3] - bias[3]))));
           }
-        } else {
+        }
+      }
+    } else if (ch < C) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c)
-            v[vi + c] = 0.f;
+      for (int j = 0; j < NL; ++j) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          const int n = oblk * WARPK + j * 8 + otld * 2 + p;
+          if (n < L) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+              if (ch + c < C)
+                mx = fmaxf(mx, fabsf(static_cast<float>(__ldg(
+                                         &in[(int64_t)n * C + ch + c])) -
+                                     bias[c]));
+          }
         }
       }
     }
@@ -247,32 +242,55 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
   if (lane == 0)
     sc_buf[oblk * 4 + otld] = sc;
 
-  if (ALIGNED4 || ch + 3 < C) {
+  // Pass 2: quantize + store every channel group.
+  for (int cc = 0; cc < C; cc += 128) {
+    const int ch = cc + lane_ch;
+    float bias[4] = {0.f, 0.f, 0.f, 0.f};
+    if (km) {
+      if (ALIGNED4 || ch + 3 < C) {
+        float4 b4 = __ldg(reinterpret_cast<const float4 *>(&km[ch]));
+        bias[0] = b4.x;
+        bias[1] = b4.y;
+        bias[2] = b4.z;
+        bias[3] = b4.w;
+      } else if (ch < C) {
 #pragma unroll
-    for (int j = 0; j < NL; ++j) {
-#pragma unroll
-      for (int p = 0; p < 2; ++p) {
-        const int n = oblk * WARPK + j * 8 + otld * 2 + p;
-        const int vi = (j * 2 + p) * 4;
-        if (n < L) {
-          store4_i8(&out[(int64_t)n * C + ch], quant_int8(v[vi], sc),
-                    quant_int8(v[vi + 1], sc), quant_int8(v[vi + 2], sc),
-                    quant_int8(v[vi + 3], sc));
-        }
+        for (int c = 0; c < 4; ++c)
+          bias[c] = (ch + c < C) ? __ldg(&km[ch + c]) : 0.f;
       }
     }
-  } else if (ch < C) {
+
+    if (ALIGNED4 || ch + 3 < C) {
 #pragma unroll
-    for (int j = 0; j < NL; ++j) {
+      for (int j = 0; j < NL; ++j) {
 #pragma unroll
-      for (int p = 0; p < 2; ++p) {
-        const int n = oblk * WARPK + j * 8 + otld * 2 + p;
-        const int vi = (j * 2 + p) * 4;
-        if (n < L) {
+        for (int p = 0; p < 2; ++p) {
+          const int n = oblk * WARPK + j * 8 + otld * 2 + p;
+          if (n < L) {
+            float v4[4];
+            VectorLoader4<T>::load(&in[(int64_t)n * C + ch], v4);
+            store4_i8(&out[(int64_t)n * C + ch],
+                      quant_int8(v4[0] - bias[0], sc),
+                      quant_int8(v4[1] - bias[1], sc),
+                      quant_int8(v4[2] - bias[2], sc),
+                      quant_int8(v4[3] - bias[3], sc));
+          }
+        }
+      }
+    } else if (ch < C) {
 #pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            if (ch + c < C)
-              out[(int64_t)n * C + ch + c] = quant_int8(v[vi + c], sc);
+      for (int j = 0; j < NL; ++j) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          const int n = oblk * WARPK + j * 8 + otld * 2 + p;
+          if (n < L) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+              if (ch + c < C)
+                out[(int64_t)n * C + ch + c] = quant_int8(
+                    static_cast<float>(__ldg(&in[(int64_t)n * C + ch + c])) -
+                        bias[c],
+                    sc);
           }
         }
       }
@@ -318,50 +336,57 @@ __global__ __launch_bounds__(MEAN_BLK_DIM) void k_mean_reduce(
 
   const int cg = threadIdx.x % MEAN_CHAN_GROUPS; // channel group 0..31
   const int rw = threadIdx.x / MEAN_CHAN_GROUPS; // row worker 0..7
-  const int ch = cg << 2;                        // starting channel
 
   const int row_base = tile * MEAN_ROWS_PER_BLK;
 
-  float4 acc = {0.f, 0.f, 0.f, 0.f};
+  __shared__ float4 smem[MEAN_ROW_WORKERS][MEAN_CHAN_GROUPS];
 
-  if (ch < C) {
-    for (int r = rw; r < MEAN_ROWS_PER_BLK; r += MEAN_ROW_WORKERS) {
-      const int n = row_base + r;
-      if (n < Lk) {
-        float vals[4];
-        VectorLoader4<T>::load(&k_in[bh_off + (int64_t)n * C + ch], vals);
-        acc.x += vals[0];
-        acc.y += vals[1];
-        acc.z += vals[2];
-        acc.w += vals[3];
+  // 32 channel groups cover 128 channels; loop in 128-channel steps so head_dim
+  // > 128 is fully reduced. C is uniform across the block, so every thread runs
+  // the same number of iterations and the __syncthreads stay convergent.
+  for (int cc = 0; cc < C; cc += 128) {
+    const int ch = cc + (cg << 2); // starting channel for this group
+
+    float4 acc = {0.f, 0.f, 0.f, 0.f};
+    if (ch < C) {
+      for (int r = rw; r < MEAN_ROWS_PER_BLK; r += MEAN_ROW_WORKERS) {
+        const int n = row_base + r;
+        if (n < Lk) {
+          float vals[4];
+          VectorLoader4<T>::load(&k_in[bh_off + (int64_t)n * C + ch], vals);
+          acc.x += vals[0];
+          acc.y += vals[1];
+          acc.z += vals[2];
+          acc.w += vals[3];
+        }
       }
     }
-  }
 
-  // Reduce across all 8 row-workers that share the same channel group.
-  // Row workers for the same channel group are in different warps, so we
-  // use shared memory: each worker writes its float4 partial, then
-  // worker 0 sums all 8 partials for its channel group.
-  __shared__ float4 smem[MEAN_ROW_WORKERS][MEAN_CHAN_GROUPS];
-  smem[rw][cg] = acc;
-  __syncthreads();
+    // Reduce across all 8 row-workers that share the same channel group.
+    // Row workers for the same channel group are in different warps, so we
+    // use shared memory: each worker writes its float4 partial, then
+    // worker 0 sums all 8 partials for its channel group.
+    __syncthreads(); // protect smem reuse across channel-group iterations
+    smem[rw][cg] = acc;
+    __syncthreads();
 
-  // First row worker (rw==0) sums all 8 partials for its channel group.
-  if (rw == 0 && ch < C) {
-    float4 s = smem[0][cg];
+    // First row worker (rw==0) sums all 8 partials for its channel group.
+    if (rw == 0 && ch < C) {
+      float4 s = smem[0][cg];
 #pragma unroll
-    for (int i = 1; i < MEAN_ROW_WORKERS; ++i) {
-      float4 v = smem[i][cg];
-      s.x += v.x;
-      s.y += v.y;
-      s.z += v.z;
-      s.w += v.w;
-    }
+      for (int i = 1; i < MEAN_ROW_WORKERS; ++i) {
+        float4 v = smem[i][cg];
+        s.x += v.x;
+        s.y += v.y;
+        s.z += v.z;
+        s.w += v.w;
+      }
 
-    atomicAdd(&km_out[bh_idx * C + ch], s.x);
-    atomicAdd(&km_out[bh_idx * C + ch + 1], s.y);
-    atomicAdd(&km_out[bh_idx * C + ch + 2], s.z);
-    atomicAdd(&km_out[bh_idx * C + ch + 3], s.w);
+      atomicAdd(&km_out[bh_idx * C + ch], s.x);
+      atomicAdd(&km_out[bh_idx * C + ch + 1], s.y);
+      atomicAdd(&km_out[bh_idx * C + ch + 2], s.z);
+      atomicAdd(&km_out[bh_idx * C + ch + 3], s.w);
+    }
   }
   __syncthreads();
 
@@ -513,6 +538,11 @@ extern "C" void launch_quant_qk_per_thread_int8(
         LAUNCH_SPLIT(T, NR, NL, 128, 32, 64, 64, true);                        \
       else                                                                     \
         LAUNCH_SPLIT(T, NR, NL, 128, 32, 64, 64, false);                       \
+    } else if (BLKQ == 128 && WARPQ == 16 && BLKK == 64 && WARPK == 64) {      \
+      if (aligned4)                                                            \
+        LAUNCH_SPLIT(T, NR, NL, 128, 16, 64, 64, true);                        \
+      else                                                                     \
+        LAUNCH_SPLIT(T, NR, NL, 128, 16, 64, 64, false);                       \
     } else {                                                                   \
       if (aligned4)                                                            \
         LAUNCH_FUSED(T, NR, NL, 128, 32, 64, 64, true);                        \

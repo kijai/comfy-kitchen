@@ -756,7 +756,11 @@ void sage_sdpa(
         throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     }
 
-    constexpr int BLKQ = 128, WARPQ = 32, BLKK = 64, WARPK = 64;
+    // head_dim 256 uses WARP_Q=16 in the attention kernel (smaller per-thread
+    // accumulator, no register spilling), so the per-thread Q quantization must
+    // produce its scales with the matching tiling. Must stay in sync with
+    // sage_attn_launcher.cu and sage_attention.py.
+    const int BLKQ = 128, WARPQ = (D >= 256) ? 16 : 32, BLKK = 64, WARPK = 64;
     constexpr int CTA_K = 64;
     const int padded_Lk = ((Lk + CTA_K - 1) / CTA_K) * CTA_K;
 

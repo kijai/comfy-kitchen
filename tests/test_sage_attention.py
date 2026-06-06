@@ -165,7 +165,7 @@ class TestSageSDPAEndToEnd:
     """Compare sage_sdpa output against torch SDPA reference."""
 
     @pytest.mark.parametrize("dtype", DTYPES)
-    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("head_dim", [64, 128, 256])
     def test_basic_accuracy(self, dtype, head_dim):
         from comfy_kitchen.sage_attention import sage_sdpa
 
@@ -215,6 +215,73 @@ class TestSageSDPAEndToEnd:
         out = sage_sdpa(q, k, v, smooth_k=False)
         ref = _ref_sdpa(q, k, v)
         assert _cos_sim(out, ref) > 0.90
+
+
+@requires_sage
+class TestSageSDPAHeadDim256:
+    """Regression coverage for the head_dim=256 path.
+
+    head_dim 256 uses a different kernel tiling than 64/128 (WARP_Q=16 →
+    num_tiles_q=1, to keep the output accumulator off the register-spill cliff).
+    Its per-thread Q quant-scale layout is produced consistently by four files
+    that must stay in sync: sage_attn_launcher.cu, dlpack_bindings.cpp,
+    quant_qk_int8.cu and sage_attention.py. A one-sided edit silently corrupts
+    half the warps' scales, so these tests lock the handshake across GQA, odd
+    sequence lengths, causal and dtype variations.
+    """
+
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_gqa(self, dtype):
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        b, h_q, h_k, n, d = 1, 16, 4, 1024, 256
+        q, k, v = _make_qkv(b, h_q, h_k, n, n, d, dtype=dtype)
+
+        out = sage_sdpa(q, k, v)
+        assert out.shape == (b, h_q, n, d)
+
+        k_expanded = k.repeat_interleave(h_q // h_k, dim=1)
+        v_expanded = v.repeat_interleave(h_q // h_k, dim=1)
+        ref = _ref_sdpa(q, k_expanded, v_expanded)
+        assert not torch.isnan(out).any()
+        assert _cos_sim(out, ref) > 0.95
+
+    @pytest.mark.parametrize("n", [77, 100, 4000, 4097])
+    def test_non_aligned_seqlen(self, n):
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        b, h, d = 1, 8, 256
+        q, k, v = _make_qkv(b, h, h, n, n, d)
+
+        out = sage_sdpa(q, k, v)
+        ref = _ref_sdpa(q, k, v)
+        assert not torch.isnan(out).any()
+        assert _cos_sim(out, ref) > 0.95
+
+    def test_causal_gqa_non_aligned(self):
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        b, h_q, h_k, n, d = 1, 16, 4, 4000, 256
+        q, k, v = _make_qkv(b, h_q, h_k, n, n, d)
+
+        out = sage_sdpa(q, k, v, is_causal=True)
+        k_expanded = k.repeat_interleave(h_q // h_k, dim=1)
+        v_expanded = v.repeat_interleave(h_q // h_k, dim=1)
+        ref = _ref_sdpa(q, k_expanded, v_expanded, is_causal=True)
+        assert not torch.isnan(out).any()
+        assert _cos_sim(out, ref) > 0.93
+
+    def test_ideogram4_heads(self):
+        # Ideogram4: 18 heads at head_dim 256 (the model this path was added for).
+        from comfy_kitchen.sage_attention import sage_sdpa
+
+        b, h, n, d = 1, 18, 1024, 256
+        q, k, v = _make_qkv(b, h, h, n, n, d)
+
+        out = sage_sdpa(q, k, v)
+        ref = _ref_sdpa(q, k, v)
+        assert not torch.isnan(out).any()
+        assert _cos_sim(out, ref) > 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +469,7 @@ class TestEdgeCases:
         from comfy_kitchen.sage_attention import sage_sdpa
 
         q, k, v = _make_qkv(1, 4, 4, 128, 128, 96)
-        with pytest.raises(ValueError, match="head_dim must be 64 or 128"):
+        with pytest.raises(ValueError, match="head_dim must be 64, 128, or 256"):
             sage_sdpa(q, k, v)
 
     @requires_sage

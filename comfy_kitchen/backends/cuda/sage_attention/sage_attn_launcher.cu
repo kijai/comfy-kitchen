@@ -26,7 +26,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   constexpr int CTA_Q = 128;
   constexpr int CTA_K = 64;
-  constexpr int WARP_Q = 32;
+  constexpr int WARP_Q = (HEAD_DIM >= 256) ? 16 : 32;
   constexpr int WARP_K = 64;
 
   size_t smem_max =
@@ -100,6 +100,8 @@ extern "C" void launch_sage_attn_kernel(
     DISPATCH_CAUSAL(64);
   } else if (head_dim == 128) {
     DISPATCH_CAUSAL(128);
+  } else if (head_dim == 256) {
+    DISPATCH_CAUSAL(256);
   } else {
     throw std::runtime_error("sage_attn: unsupported head_dim " +
                              std::to_string(head_dim));
