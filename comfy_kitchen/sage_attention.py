@@ -115,6 +115,7 @@ def sage_sdpa(
     smooth_k: bool = True,
     pv_fp16_accum: bool = True,
     qk_quant_gran: int | None = None,
+    free_qkv: bool = False,
 ) -> torch.Tensor:
     """SageAttention scaled dot-product attention.
 
@@ -132,6 +133,10 @@ def sage_sdpa(
     qk_quant_gran : int | None  — INT8 Q/K quant granularity: 0 = per-thread,
         1 = per-warp. None (default) auto-selects per upstream SageAttention:
         per-warp on sm120 (Blackwell), per-thread on sm89/sm90.
+    free_qkv : bool  — release the bf16 q/k/v storage in place (resize_(0))
+        between quantisation and attention to cut peak VRAM by ~0.5x(q+k+v).
+        ONLY set this when the caller does not use q/k/v after attention (true
+        for standard attention forwards). Currently applies to per-thread quant.
 
     Returns
     -------
@@ -164,49 +169,76 @@ def sage_sdpa(
     q_sc_mult = 1 if qk_quant_gran == 1 else 8
     k_sc_mult = 1 if qk_quant_gran == 1 else 4
 
-    q_int8 = torch.empty_like(q, dtype=torch.int8)
-    k_int8 = torch.empty_like(k, dtype=torch.int8)
-    q_scale = torch.empty(
-        b,
-        h_q,
-        ((n_q + blkq - 1) // blkq) * (blkq // warpq) * q_sc_mult,
-        device=q.device,
-        dtype=torch.float32,
-    )
-    k_scale = torch.empty(
-        b,
-        h_k,
-        ((n_k + blkk - 1) // blkk) * (blkk // warpk) * k_sc_mult,
-        device=q.device,
-        dtype=torch.float32,
-    )
-    v_quant = torch.empty(
-        b * h_k * d,
-        padded_n_k,
-        dtype=torch.float8_e4m3fn,
-        device=q.device,
-    )
-    v_scale = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+    q_sc_n = ((n_q + blkq - 1) // blkq) * (blkq // warpq) * q_sc_mult
+    k_sc_n = ((n_k + blkk - 1) // blkk) * (blkk // warpk) * k_sc_mult
 
     original_dtype = q.dtype
-    if q.dtype == torch.float32:
-        output_dtype = torch.bfloat16
-    else:
-        output_dtype = q.dtype
-
-    output = torch.empty(b, h_q, n_q, d, dtype=output_dtype, device=q.device)
-
-    km_scratch_ptr = 0
-    km_done_ptr = 0
-    if smooth_k:
-        km_scratch = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
-        km_done = torch.empty(b * h_k, device=q.device, dtype=torch.int32)
-        km_scratch_ptr = km_scratch.data_ptr()
-        km_done_ptr = km_done.data_ptr()
-
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     input_dtype_code = DTYPE_TO_CODE[original_dtype]
     output_dtype_code = DTYPE_TO_CODE[output_dtype]
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    v_scale_max = 2.25 if pv_fp16_accum else 448.0
+
+    def _scale(h, n):
+        return torch.empty(b, h, n, device=q.device, dtype=torch.float32)
+
+    def _alloc_km():
+        if not smooth_k:
+            return 0, 0, None, None
+        kms = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+        kmd = torch.empty(b * h_k, device=q.device, dtype=torch.int32)
+        return kms.data_ptr(), kmd.data_ptr(), kms, kmd
+
+    def _free(t):
+        try:
+            t.untyped_storage().resize_(0)
+        except Exception:
+            pass
+
+    if free_qkv and qk_quant_gran == 0:
+        # Low-peak path: allocate just-in-time and free each bf16 input right
+        # after quantising it, interleaved — V first, then Q/K — so the peak
+        # never holds bf16 q/k/v together with all the quantized copies + output.
+        # Brings peak to ~1.17x(qkv), below SDPA's ~1.33x. Single CUDA stream, so
+        # freeing/reallocating between launches is ordered and safe. Destructive
+        # to q/k/v (they become 0-byte) — only valid when unused after attention.
+        v_quant = torch.empty(b * h_k * d, padded_n_k, dtype=torch.float8_e4m3fn, device=q.device)
+        v_scale = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+        _C._quant_v_fp8(_wrap_for_dlpack(v), _wrap_for_dlpack(v_quant),
+                        _wrap_for_dlpack(v_scale), padded_n_k, input_dtype_code,
+                        stream_ptr, v_scale_max)
+        _free(v)
+
+        q_int8 = torch.empty_like(q, dtype=torch.int8)
+        k_int8 = torch.empty_like(k, dtype=torch.int8)
+        q_scale, k_scale = _scale(h_q, q_sc_n), _scale(h_k, k_sc_n)
+        kmp, kmd_p, _kms, _kmd = _alloc_km()
+        _C._quant_qk_per_thread_int8(
+            _wrap_for_dlpack(q), _wrap_for_dlpack(q_int8), _wrap_for_dlpack(q_scale),
+            _wrap_for_dlpack(k), _wrap_for_dlpack(k_int8), _wrap_for_dlpack(k_scale),
+            blkq, warpq, blkk, warpk, input_dtype_code, stream_ptr,
+            int(smooth_k), kmp, kmd_p)
+        _free(q)
+        _free(k)
+
+        output = torch.empty(b, h_q, n_q, d, dtype=output_dtype, device=q.device)
+        _C._sage_attn(
+            _wrap_for_dlpack(q_int8), _wrap_for_dlpack(k_int8),
+            _wrap_for_dlpack(v_quant.view(b, h_k, d, padded_n_k)),
+            _wrap_for_dlpack(output),
+            _wrap_for_dlpack(q_scale), _wrap_for_dlpack(k_scale), _wrap_for_dlpack(v_scale),
+            int(is_causal), d**-0.5, output_dtype_code, stream_ptr,
+            int(pv_fp16_accum), int(qk_quant_gran))
+        return output.to(torch.float32) if original_dtype == torch.float32 else output
+
+    # Fused path (default): all buffers allocated upfront, single fused call.
+    q_int8 = torch.empty_like(q, dtype=torch.int8)
+    k_int8 = torch.empty_like(k, dtype=torch.int8)
+    q_scale, k_scale = _scale(h_q, q_sc_n), _scale(h_k, k_sc_n)
+    v_quant = torch.empty(b * h_k * d, padded_n_k, dtype=torch.float8_e4m3fn, device=q.device)
+    v_scale = torch.empty(b * h_k * d, device=q.device, dtype=torch.float32)
+    output = torch.empty(b, h_q, n_q, d, dtype=output_dtype, device=q.device)
+    km_scratch_ptr, km_done_ptr, _kms, _kmd = _alloc_km()
 
     _C.sage_sdpa(
         _wrap_for_dlpack(q),

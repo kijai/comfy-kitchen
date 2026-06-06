@@ -620,7 +620,8 @@ void quant_v_fp8(
     nb::ndarray<nb::device::cuda> scale,
     int padded_n,
     int input_dtype_code,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr,
+    float v_scale_max = 448.0f)
 {
     if (v.ndim() != 4) {
         throw std::runtime_error("quant_v_fp8: v must be 4D [B,H,N,D]");
@@ -634,7 +635,7 @@ void quant_v_fp8(
         static_cast<int>(v.shape(3)),
         padded_n,
         v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, /*v_scale_max=*/448.0f, stream);
+        input_dtype_code, v_scale_max, stream);
 }
 
 // Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
@@ -687,7 +688,9 @@ void sage_attn(
     int is_causal,
     float sm_scale,
     int output_dtype_code,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr,
+    int pv_fp16_accum = 0,
+    int qk_quant_gran = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_attn: q, k, v, o must be 4D");
@@ -722,7 +725,7 @@ void sage_attn(
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(2), o.stride(1),
         is_causal, sm_scale, output_dtype_code,
-        /*pv_fp16_accum=*/0, /*qk_per_warp_gran=*/0, stream);
+        pv_fp16_accum, qk_quant_gran, stream);
 }
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
@@ -1053,7 +1056,8 @@ NB_MODULE(_C, m) {
           nb::arg("scale"),
           nb::arg("padded_n"),
           nb::arg("input_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("v_scale_max") = 448.0f);
 
     m.def("_quant_qk_per_thread_int8", &quant_qk_per_thread_int8,
           "INT8 per-thread quant for Q and K (HND), same tiling as Triton quant_per_thread",
@@ -1085,7 +1089,9 @@ NB_MODULE(_C, m) {
           nb::arg("is_causal"),
           nb::arg("sm_scale"),
           nb::arg("output_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("pv_fp16_accum") = 0,
+          nb::arg("qk_quant_gran") = 0);
 
     m.def("sage_sdpa", &sage_sdpa,
           "Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one call",

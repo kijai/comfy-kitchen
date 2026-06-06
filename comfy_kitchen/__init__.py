@@ -474,6 +474,9 @@ def sage_sdpa(
     v: torch.Tensor,
     is_causal: bool = False,
     smooth_k: bool = True,
+    pv_fp16_accum: bool = True,
+    qk_quant_gran: "int | None" = None,
+    free_qkv: bool = False,
 ) -> torch.Tensor:
     """SageAttention scaled dot-product attention.
 
@@ -483,12 +486,19 @@ def sage_sdpa(
         v: Value tensor [B, H_K, N_K, D]
         is_causal: Whether to apply causal masking
         smooth_k: Whether to subtract per-head K mean before quantisation
+        pv_fp16_accum: Accumulate the P@V matmul in fp16 (SageAttention2++)
+        qk_quant_gran: INT8 Q/K quant granularity (0=per-thread, 1=per-warp,
+            None=auto: per-warp on sm120, per-thread otherwise)
+        free_qkv: Release the bf16 q/k/v storage between quant and attention to
+            cut peak VRAM (destructive; only when q/k/v unused afterwards)
 
     Returns:
         Output tensor [B, H_Q, N_Q, D] (same dtype as q)
     """
     from .sage_attention import sage_sdpa as _sage_sdpa
-    return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k)
+    return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k,
+                      pv_fp16_accum=pv_fp16_accum, qk_quant_gran=qk_quant_gran,
+                      free_qkv=free_qkv)
 
 
 # =============================================================================
