@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "modulated_rmsnorm",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -1919,6 +1920,50 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
     return out_flat.reshape(orig_shape)
 
 
+def modulated_rmsnorm(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float = 1e-6,
+    plus_one_scale: bool = True,
+) -> torch.Tensor:
+    orig_shape = x.shape
+    d = x.shape[-1]
+    n = x.numel() // d
+
+    x_flat = x.reshape(n, d)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+
+    # gamma (RMSNorm weight) is kept in fp32 to match the reference numerics.
+    gamma_flat = gamma.reshape(d).to(device=x.device, dtype=torch.float32).contiguous()
+    scale_flat, scale_group = adaln_prep_modulation(scale, x, n, d)
+    shift_flat, shift_group = adaln_prep_modulation(shift, x, n, d)
+
+    out_flat = torch.empty_like(x_flat)
+    dtype_code = DTYPE_TO_CODE[x.dtype]
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    _C.modulated_rmsnorm(
+        _wrap_for_dlpack(x_flat),
+        _wrap_for_dlpack(gamma_flat),
+        _wrap_for_dlpack(scale_flat),
+        _wrap_for_dlpack(shift_flat),
+        _wrap_for_dlpack(out_flat),
+        n,
+        d,
+        scale_group,
+        shift_group,
+        eps,
+        int(plus_one_scale),
+        dtype_code,
+        stream_ptr,
+    )
+
+    return out_flat.reshape(orig_shape)
+
+
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     if not x.is_contiguous():
         x = x.contiguous()
@@ -2518,6 +2563,20 @@ def _build_constraints() -> dict:
 
     constraints = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "shift": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "modulated_rmsnorm": FunctionConstraints(
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),

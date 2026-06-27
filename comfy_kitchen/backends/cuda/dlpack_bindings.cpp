@@ -239,6 +239,22 @@ extern "C" {
         float       eps,
         int         dtype_code,
         cudaStream_t stream);
+
+    // Fused modulated RMSNorm — see ops/modulated_rmsnorm.cu.
+    void launch_modulated_rmsnorm_kernel(
+        const void* x,
+        const void* gamma,
+        const void* scale,
+        const void* shift,
+        void*       out,
+        int64_t     N,
+        int64_t     D,
+        int64_t     scale_group,
+        int64_t     shift_group,
+        float       eps,
+        int         plus_one,
+        int         dtype_code,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -911,6 +927,28 @@ void adaln(
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
         N, D, scale_group, shift_group, eps, dtype_code, stream);
+}
+
+// Nanobind wrapper for fused modulated RMSNorm
+void modulated_rmsnorm(
+    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> gamma,
+    nb::ndarray<nb::device::cuda> scale,
+    nb::ndarray<nb::device::cuda> shift,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t N,
+    int64_t D,
+    int64_t scale_group,
+    int64_t shift_group,
+    float   eps,
+    int     plus_one,
+    int     dtype_code,
+    uintptr_t stream_ptr)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_modulated_rmsnorm_kernel(
+        x.data(), gamma.data(), scale.data(), shift.data(), out.data(),
+        N, D, scale_group, shift_group, eps, plus_one, dtype_code, stream);
 }
 
 // Python module definition
@@ -2657,6 +2695,22 @@ NB_MODULE(_C, m) {
           nb::arg("scale_group"),
           nb::arg("shift_group"),
           nb::arg("eps"),
+          nb::arg("dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("modulated_rmsnorm", &modulated_rmsnorm,
+          "Fused modulated RMSNorm: (rmsnorm(x) * gamma) * (1 + scale) + shift",
+          nb::arg("x"),
+          nb::arg("gamma"),
+          nb::arg("scale"),
+          nb::arg("shift"),
+          nb::arg("out"),
+          nb::arg("N"),
+          nb::arg("D"),
+          nb::arg("scale_group"),
+          nb::arg("shift_group"),
+          nb::arg("eps"),
+          nb::arg("plus_one"),
           nb::arg("dtype_code"),
           nb::arg("stream_ptr"));
 

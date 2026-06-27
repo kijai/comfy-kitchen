@@ -130,6 +130,7 @@ set(CUDA_SOURCES
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
     ops/adaln.cu
+    ops/modulated_rmsnorm.cu
 )
 
 set(CPP_SOURCES

@@ -26,6 +26,7 @@ from .tensor.convrot_w4a4 import (
 __all__ = [
     # Normalization
     "adaln",
+    "modulated_rmsnorm",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -97,6 +98,36 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def modulated_rmsnorm(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float = 1e-6,
+    plus_one_scale: bool = True,
+) -> torch.Tensor:
+    """Fused modulated RMSNorm: (rms_norm(x) * gamma) * (1 + scale) + shift.
+
+    The AdaLN-single norm of single-stream DiTs (Krea2): RMSNorm over the last
+    dim with per-channel weight ``gamma``, then per-sample modulation. Reads x
+    once and accumulates in fp32; numerically equivalent to the eager path
+    (fp32 rms_norm -> bf16 -> modulate) within ~1 bf16 ULP.
+
+    Args:
+        x: Input tensor (..., D)
+        scale: Modulation scale, broadcastable to x (per-sample (...,1,D))
+        shift: Modulation shift, broadcastable to x
+        gamma: RMSNorm per-channel weight [D] (pass (1 + stored_scale) for the
+            zero-centered weight convention)
+        eps: RMSNorm epsilon
+        plus_one_scale: If True, modulate by (1 + scale); else by scale
+
+    Returns:
+        Tensor with the same shape as x
+    """
+    return torch.ops.comfy_kitchen.modulated_rmsnorm(x, scale, shift, gamma, eps, plus_one_scale)
 
 
 def quantize_per_tensor_fp8(
