@@ -6,6 +6,7 @@
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
@@ -545,21 +546,25 @@ __global__ void dequantize_int8_rowwise_vec4_2d_kernel(
     int rows,
     int inner_dim_vec4)
 {
-    const int row = static_cast<int>(blockIdx.y);
     const int col4 = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (row >= rows || col4 >= inner_dim_vec4) {
+    if (col4 >= inner_dim_vec4) {
         return;
     }
 
-    const int64_t idx4 = static_cast<int64_t>(row) * inner_dim_vec4 + col4;
-    const char4 q4 = reinterpret_cast<const char4*>(input)[idx4];
-    const float scale = scales[row];
-    const int64_t idx = idx4 * 4;
-    store4_contiguous(output, idx,
-        static_cast<float>(q4.x) * scale,
-        static_cast<float>(q4.y) * scale,
-        static_cast<float>(q4.z) * scale,
-        static_cast<float>(q4.w) * scale);
+    // gridDim.y is capped at 65535, so blocks stride over rows to cover
+    // taller inputs (activation tensors can exceed 65535 tokens).
+    for (int row = static_cast<int>(blockIdx.y); row < rows;
+         row += static_cast<int>(gridDim.y)) {
+        const int64_t idx4 = static_cast<int64_t>(row) * inner_dim_vec4 + col4;
+        const char4 q4 = reinterpret_cast<const char4*>(input)[idx4];
+        const float scale = scales[row];
+        const int64_t idx = idx4 * 4;
+        store4_contiguous(output, idx,
+            static_cast<float>(q4.x) * scale,
+            static_cast<float>(q4.y) * scale,
+            static_cast<float>(q4.z) * scale,
+            static_cast<float>(q4.w) * scale);
+    }
 }
 
 template<int BLOCK_THREADS, typename OutputType>
@@ -721,6 +726,7 @@ __global__ void dequantize_int8_convrot_groups64_kernel(
     const int8_t* __restrict__ q,
     const float* __restrict__ scales,
     OutputType* __restrict__ output,
+    int num_rows,
     int K,
     int scale_size)
 {
@@ -730,34 +736,39 @@ __global__ void dequantize_int8_convrot_groups64_kernel(
     const int sub = threadIdx.x / kGroupThreads;
     const int lane = threadIdx.x % kGroupThreads;
     const int group = static_cast<int>(blockIdx.x) * GROUPS_PER_BLOCK + sub;
-    const int row = static_cast<int>(blockIdx.y);
     const bool active = group < K / kConvRotGroup;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
     const int group_col = group * kConvRotGroup;
-    const float scale = scales[scale_size == 1 ? 0 : row];
 
     float* buf0 = smem + sub * (2 * kConvRotGroup);
     float* buf1 = buf0 + kConvRotGroup;
 
     const int base = lane * 4;
-    const int64_t q_offset = row_offset + group_col + base;
-    const float x0 = active ? static_cast<float>(q[q_offset]) * scale : 0.0f;
-    const float x1 = active ? static_cast<float>(q[q_offset + 1]) * scale : 0.0f;
-    const float x2 = active ? static_cast<float>(q[q_offset + 2]) * scale : 0.0f;
-    const float x3 = active ? static_cast<float>(q[q_offset + 3]) * scale : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-    __syncthreads();
+    // gridDim.y is capped at 65535, so blocks stride over rows to cover
+    // taller inputs (activation tensors can exceed 65535 tokens).
+    for (int row = static_cast<int>(blockIdx.y); row < num_rows;
+         row += static_cast<int>(gridDim.y)) {
+        const int64_t row_offset = static_cast<int64_t>(row) * K;
+        const float scale = scales[scale_size == 1 ? 0 : row];
+        const int64_t q_offset = row_offset + group_col + base;
+        const float x0 = active ? static_cast<float>(q[q_offset]) * scale : 0.0f;
+        const float x1 = active ? static_cast<float>(q[q_offset + 1]) * scale : 0.0f;
+        const float x2 = active ? static_cast<float>(q[q_offset + 2]) * scale : 0.0f;
+        const float x3 = active ? static_cast<float>(q[q_offset + 3]) * scale : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
 
-    convrot_fht_stage64<4>(buf1, buf0, lane);
-    __syncthreads();
-    convrot_fht_stage64<16>(buf0, buf1, lane);
-    __syncthreads();
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
 
-    if (active) {
-        convrot_fht_stage64_store<64, OutputType>(buf1, output + row_offset + group_col, lane);
+        if (active) {
+            convrot_fht_stage64_store<64, OutputType>(buf1, output + row_offset + group_col, lane);
+        }
+        __syncthreads();  // buf1 is read by the store; don't overwrite until all done
     }
 }
 
@@ -766,6 +777,7 @@ __global__ void rotate_int8_convrot_groups64_amax_kernel(
     const InputType* __restrict__ x,
     OutputType* __restrict__ output,
     float* __restrict__ partial_absmax,
+    int num_rows,
     int K)
 {
     constexpr int kGroupThreads = 64;
@@ -774,46 +786,51 @@ __global__ void rotate_int8_convrot_groups64_amax_kernel(
     const int sub = threadIdx.x / kGroupThreads;
     const int lane = threadIdx.x % kGroupThreads;
     const int group = static_cast<int>(blockIdx.x) * GROUPS_PER_BLOCK + sub;
-    const int row = static_cast<int>(blockIdx.y);
     const int n_groups = K / kConvRotGroup;
     const bool active = group < n_groups;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
     const int group_col = group * kConvRotGroup;
 
     float* buf0 = smem + sub * (2 * kConvRotGroup);
     float* buf1 = buf0 + kConvRotGroup;
 
     const int base = lane * 4;
-    const int64_t x_offset = row_offset + group_col + base;
-    const float x0 = active ? to_float(x[x_offset]) : 0.0f;
-    const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
-    const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
-    const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-    __syncthreads();
+    // gridDim.y is capped at 65535, so blocks stride over rows to cover
+    // taller inputs (activation tensors can exceed 65535 tokens).
+    for (int row = static_cast<int>(blockIdx.y); row < num_rows;
+         row += static_cast<int>(gridDim.y)) {
+        const int64_t row_offset = static_cast<int64_t>(row) * K;
+        const int64_t x_offset = row_offset + group_col + base;
+        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
+        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
+        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
+        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
 
-    convrot_fht_stage64<4>(buf1, buf0, lane);
-    __syncthreads();
-    convrot_fht_stage64<16>(buf0, buf1, lane);
-    __syncthreads();
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
 
-    float local_max = 0.0f;
-    if (active) {
-        local_max = convrot_fht_stage64_store_absmax<64, OutputType>(
-            buf1, output + row_offset + group_col, lane);
-    }
-    buf0[lane] = local_max;
-    __syncthreads();
-
-    if (lane < 32) {
-        float v = fmaxf(buf0[lane], buf0[lane + 32]);
-        v = warp_reduce_max(v);
-        if (lane == 0 && active) {
-            partial_absmax[static_cast<int64_t>(row) * n_groups + group] = v;
+        float local_max = 0.0f;
+        if (active) {
+            local_max = convrot_fht_stage64_store_absmax<64, OutputType>(
+                buf1, output + row_offset + group_col, lane);
         }
+        buf0[lane] = local_max;
+        __syncthreads();
+
+        if (lane < 32) {
+            float v = fmaxf(buf0[lane], buf0[lane + 32]);
+            v = warp_reduce_max(v);
+            if (lane == 0 && active) {
+                partial_absmax[static_cast<int64_t>(row) * n_groups + group] = v;
+            }
+        }
+        __syncthreads();  // buf0/buf1 are still being read; don't overwrite until all done
     }
 }
 
@@ -821,6 +838,7 @@ template<int GROUPS_PER_BLOCK, typename InputType, typename OutputType>
 __global__ void rotate_int8_convrot_groups64_kernel(
     const InputType* __restrict__ x,
     OutputType* __restrict__ output,
+    int num_rows,
     int K)
 {
     constexpr int kGroupThreads = 64;
@@ -829,33 +847,38 @@ __global__ void rotate_int8_convrot_groups64_kernel(
     const int sub = threadIdx.x / kGroupThreads;
     const int lane = threadIdx.x % kGroupThreads;
     const int group = static_cast<int>(blockIdx.x) * GROUPS_PER_BLOCK + sub;
-    const int row = static_cast<int>(blockIdx.y);
     const bool active = group < K / kConvRotGroup;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
     const int group_col = group * kConvRotGroup;
 
     float* buf0 = smem + sub * (2 * kConvRotGroup);
     float* buf1 = buf0 + kConvRotGroup;
 
     const int base = lane * 4;
-    const int64_t x_offset = row_offset + group_col + base;
-    const float x0 = active ? to_float(x[x_offset]) : 0.0f;
-    const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
-    const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
-    const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-    __syncthreads();
+    // gridDim.y is capped at 65535, so blocks stride over rows to cover
+    // taller inputs (activation tensors can exceed 65535 tokens).
+    for (int row = static_cast<int>(blockIdx.y); row < num_rows;
+         row += static_cast<int>(gridDim.y)) {
+        const int64_t row_offset = static_cast<int64_t>(row) * K;
+        const int64_t x_offset = row_offset + group_col + base;
+        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
+        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
+        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
+        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
 
-    convrot_fht_stage64<4>(buf1, buf0, lane);
-    __syncthreads();
-    convrot_fht_stage64<16>(buf0, buf1, lane);
-    __syncthreads();
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
 
-    if (active) {
-        convrot_fht_stage64_store<64, OutputType>(buf1, output + row_offset + group_col, lane);
+        if (active) {
+            convrot_fht_stage64_store<64, OutputType>(buf1, output + row_offset + group_col, lane);
+        }
+        __syncthreads();  // buf1 is read by the store; don't overwrite until all done
     }
 }
 
@@ -1141,13 +1164,17 @@ void launch_rotate_int8_convrot_weight_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot rotate kernel only supports K <= INT_MAX");
     }
+    if (num_rows > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("convrot rotate kernel only supports rows <= INT_MAX");
+    }
 
     constexpr int groups_per_block = 8;
     constexpr int block_threads = groups_per_block * 64;
     const int group_blocks =
         static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
     const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
-    dim3 grid(static_cast<unsigned int>(group_blocks), static_cast<unsigned int>(num_rows));
+    dim3 grid(static_cast<unsigned int>(group_blocks),
+              static_cast<unsigned int>(std::min<int64_t>(num_rows, 65535)));
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
@@ -1155,6 +1182,7 @@ void launch_rotate_int8_convrot_weight_kernel(
                 <<<grid, block_threads, smem_bytes, stream>>>(
                     static_cast<const InputType*>(input),
                     static_cast<OutputType*>(output),
+                    static_cast<int>(num_rows),
                     static_cast<int>(num_cols));
         });
     });
@@ -1192,13 +1220,17 @@ void launch_quantize_int8_convrot_staged_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot staged quantize only supports K <= INT_MAX");
     }
+    if (num_rows > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("convrot staged quantize only supports rows <= INT_MAX");
+    }
 
     constexpr int groups_per_block = 8;
     constexpr int rotate_threads = groups_per_block * 64;
     const int group_blocks =
         static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
     const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
-    dim3 rotate_grid(static_cast<unsigned int>(group_blocks), static_cast<unsigned int>(num_rows));
+    dim3 rotate_grid(static_cast<unsigned int>(group_blocks),
+                     static_cast<unsigned int>(std::min<int64_t>(num_rows, 65535)));
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         DISPATCH_FP_DTYPE(rotated_dtype_code, RotatedType, [&] {
@@ -1207,6 +1239,7 @@ void launch_quantize_int8_convrot_staged_kernel(
                     static_cast<const InputType*>(input),
                     static_cast<RotatedType*>(rotated),
                     static_cast<float*>(partial_absmax),
+                    static_cast<int>(num_rows),
                     static_cast<int>(num_cols));
         });
     });
@@ -1559,7 +1592,8 @@ void launch_dequantize_int8_simple_kernel(
         if (inner_dim >= 1024 && rows <= static_cast<int64_t>(std::numeric_limits<int>::max())) {
             const int block_threads = inner_dim >= 4096 ? 512 : comfy::kInt8Threads;
             const int blocks_x = static_cast<int>((inner_dim_vec4 + block_threads - 1) / block_threads);
-            dim3 grid(static_cast<unsigned int>(blocks_x), static_cast<unsigned int>(rows));
+            dim3 grid(static_cast<unsigned int>(blocks_x),
+                      static_cast<unsigned int>(std::min<int64_t>(rows, 65535)));
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
                 comfy::dequantize_int8_rowwise_vec4_2d_kernel<OutputType>
                     <<<grid, block_threads, 0, stream>>>(
@@ -1661,6 +1695,9 @@ void launch_dequantize_int8_convrot_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot dequant kernel only supports K <= INT_MAX");
     }
+    if (num_rows > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("convrot dequant kernel only supports rows <= INT_MAX");
+    }
     if (scale_size != 1 && scale_size != num_rows) {
         throw std::runtime_error("convrot dequant scale must be scalar or per-row");
     }
@@ -1672,13 +1709,15 @@ void launch_dequantize_int8_convrot_kernel(
             const int group_blocks =
                 static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
             const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
-            dim3 grid(static_cast<unsigned int>(group_blocks), static_cast<unsigned int>(num_rows));
+            dim3 grid(static_cast<unsigned int>(group_blocks),
+                      static_cast<unsigned int>(std::min<int64_t>(num_rows, 65535)));
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
                 comfy::dequantize_int8_convrot_groups64_kernel<groups_per_block, OutputType>
                     <<<grid, block_threads, smem_bytes, stream>>>(
                         static_cast<const int8_t*>(input),
                         static_cast<const float*>(scales),
                         static_cast<OutputType*>(output),
+                        static_cast<int>(num_rows),
                         static_cast<int>(num_cols),
                         static_cast<int>(scale_size));
             });
