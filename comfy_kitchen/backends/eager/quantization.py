@@ -21,7 +21,9 @@ from comfy_kitchen.float_utils import (
     roundup,
     to_blocked,
 )
+from comfy_kitchen.registry import registry
 from comfy_kitchen.scaled_mm_v2 import ScalingType, SwizzleType, scaled_mm_v2
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation, _rotate_weight
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -424,8 +426,6 @@ def _op_quantize_fp8(
     Returns:
         Quantized FP8 tensor
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
     impl = registry.get_implementation("quantize_per_tensor_fp8", kwargs=kwargs)
@@ -454,8 +454,6 @@ def _op_dequantize_fp8(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
     impl = registry.get_implementation("dequantize_per_tensor_fp8", kwargs=kwargs)
@@ -489,8 +487,6 @@ def _op_quantize_nvfp4(
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "per_tensor_scale": per_tensor_scale, "epsilon": epsilon, "pad_16x": pad_16x, "hi_first": hi_first}
     impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
@@ -536,8 +532,6 @@ def _op_dequantize_nvfp4(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"qx": qx, "per_tensor_scale": per_tensor_scale, "block_scales": block_scales, "output_type": output_dtype, "hi_first": hi_first}
     impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
@@ -582,8 +576,6 @@ def _op_scaled_mm_nvfp4(
     Returns:
         Result tensor of shape (M, N)
     """
-    from comfy_kitchen.registry import registry
-
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
         "a": a, "b": b,
@@ -626,8 +618,6 @@ def _op_quantize_mxfp8(
     Returns:
         Tuple of (quantized_fp8_tensor, block_scales_e8m0)
     """
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "pad_32x": pad_32x}
     impl = registry.get_implementation("quantize_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
@@ -670,8 +660,6 @@ def _op_dequantize_mxfp8(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"qx": qx, "block_scales": block_scales, "output_type": output_dtype}
     impl = registry.get_implementation("dequantize_mxfp8", kwargs=kwargs)
@@ -708,8 +696,6 @@ def _op_scaled_mm_mxfp8(
     Returns:
         Result tensor of shape (M, N)
     """
-    from comfy_kitchen.registry import registry
-
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
         "a": a, "b": b,
@@ -728,3 +714,457 @@ def _op_scaled_mm_mxfp8_fake(
     m = a.shape[0]
     n = b.shape[0]
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
+# =============================================================================
+# INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
+# =============================================================================
+# Simpler approach: single scale per tensor + per-row activation scaling.
+# Uses torch._int_mm for cuBLASLt acceleration on CUDA.
+
+
+_turing_device_cache: dict[int, bool] = {}
+
+
+def _cuda_device_is_turing(device_index: int) -> bool:
+    cached = _turing_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
+    except RuntimeError:
+        is_turing = False
+    _turing_device_cache[device_index] = is_turing
+    return is_turing
+
+
+def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
+    # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
+    return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Multiply INT8 matrices and return INT32 accumulators."""
+    def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        if hasattr(torch, "int8_mm"):
+            return torch.int8_mm(lhs, rhs)
+        return torch._int_mm(lhs, rhs)
+
+    orig_m = a.size(0)
+    orig_n = b.size(1)
+    k = a.size(1)
+    if orig_m == 0 or k == 0:
+        return fast_int8_mm(a, b)
+
+    padded_m = _round_up(max(orig_m, 32), 32) if a.is_cuda else orig_m
+    if padded_m != orig_m:
+        row_padding = torch.zeros((padded_m - orig_m, k), device=a.device, dtype=a.dtype)
+        a = torch.cat((a, row_padding), dim=0)
+
+    padded_k = ((k + 7) // 8) * 8
+    if padded_k != k:
+        a_padding = torch.zeros((a.size(0), padded_k - k), device=a.device, dtype=a.dtype)
+        b_padding = torch.zeros((padded_k - k, b.size(1)), device=b.device, dtype=b.dtype)
+        a = torch.cat((a, a_padding), dim=1)
+        b = torch.cat((b, b_padding), dim=0)
+
+    padded_n = _round_up(orig_n, _int8_mm_n_alignment(a))
+    if padded_n != orig_n:
+        b_padding = torch.zeros((b.size(0), padded_n - orig_n), device=b.device, dtype=b.dtype)
+        b = torch.cat((b, b_padding), dim=1)
+
+    result = fast_int8_mm(a, b)
+    if result.size(0) != orig_m or result.size(1) != orig_n:
+        result = result[:orig_m, :orig_n]
+    return result
+
+
+def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
+
+    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
+
+    Args:
+        a: INT8 tensor [M, K].
+        b: INT8 tensor [K, N].
+
+    Returns:
+        INT32 tensor [M, N] with accumulated dot products.
+    """
+    assert a.dtype == torch.int8 and b.dtype == torch.int8
+    assert a.dim() == 2 and b.dim() == 2
+    assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
+    return _int8_matmul_accumulate(a, b)
+
+
+def _int8_stochastic_rng(x: torch.Tensor, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(seed)
+    return torch.rand(
+        x.shape,
+        dtype=x.dtype,
+        layout=x.layout,
+        device=x.device,
+        generator=generator,
+    )
+
+
+def _int8_scale_for_math(scale: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    scale = scale.to(device=x.device, dtype=x.dtype)
+    scale_min = torch.finfo(x.dtype).tiny
+    return torch.where(scale == 0, torch.full_like(scale, scale_min), scale)
+
+
+def _round_int8(scaled: torch.Tensor, stochastic_rounding: int | None = 0) -> torch.Tensor:
+    if stochastic_rounding is not None and stochastic_rounding > 0:
+        rng = _int8_stochastic_rng(scaled, stochastic_rounding)
+        scaled.add_(rng)
+        return scaled.floor_().clamp_(-128.0, 127.0).to(torch.int8)
+    return scaled.round_().clamp_(-128.0, 127.0).to(torch.int8)
+
+
+def quantize_int8_tensorwise(
+    x: torch.Tensor,
+    scale: torch.Tensor | float | str | None = None,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale.
+
+    Args:
+        x: Input tensor of any shape.
+        scale: Optional scale. "recalculate" computes scale from absmax.
+        stochastic_rounding: Seed for stochastic rounding. Disabled when <= 0.
+
+    Returns:
+        Tuple of (quantized_int8, scale):
+            - quantized_int8: INT8 tensor with same shape
+            - scale: Scalar float32 tensor
+    """
+    if scale is None or (isinstance(scale, str) and scale == "recalculate"):
+        abs_max = x.abs().max()
+        scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    elif not isinstance(scale, torch.Tensor):
+        scale = torch.tensor(scale, device=x.device, dtype=torch.float32)
+    else:
+        scale = scale.to(device=x.device, dtype=torch.float32)
+    q = _round_int8(x / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding)
+    return q, scale
+
+
+def quantize_int8_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations).
+
+    Args:
+        x: Input tensor [..., K] where quantization is per-row.
+        stochastic_rounding: Seed for stochastic rounding. Disabled when <= 0.
+
+    Returns:
+        Tuple of (quantized_int8, scales):
+            - quantized_int8: INT8 tensor with same shape
+            - scales: Float32 tensor [..., 1] with per-row scales
+    """
+    abs_max = x.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    q = _round_int8(x / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding)
+    return q, scale
+
+
+def quantize_and_rotate_rowwise(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused online activation rotation + row-wise quantization (Eager fallback).
+
+    Args:
+        x: Input unrotated activation tensor [M, K].
+        h: Pre-built normalized Hadamard matrix [group_size, group_size].
+        group_size: ConvRot group size.
+
+    Returns:
+        Tuple of (rotated_quantized_x_int8, row_scales).
+    """
+    x_rot = _rotate_activation(x, h, group_size)
+    return quantize_int8_rowwise(x_rot, stochastic_rounding=stochastic_rounding)
+
+
+def quantize_int8_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Offline ConvRot weight rotation followed by row-wise INT8 quantization."""
+    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    weight_rot = _rotate_weight(weight, h, group_size)
+    return quantize_int8_rowwise(weight_rot, stochastic_rounding=stochastic_rounding)
+
+
+def dequantize_int8_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Dequantize INT8 ConvRot weights and rotate them back to the original basis."""
+    h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
+    return _rotate_weight(dequantize_int8_simple(q, scale), h, group_size)
+
+
+def dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor, scale: torch.Tensor, group_size: int, output_dtype_code: int
+) -> torch.Tensor:
+    """Dequantize INT8 ConvRot weights into a requested floating dtype."""
+    return dequantize_int8_convrot_weight(q, scale, group_size).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale.
+
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale tensor (scalar or broadcastable).
+
+    Returns:
+        Dequantized float tensor.
+    """
+    return q.float() * scale
+
+
+def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale into a requested floating dtype."""
+    return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
+
+    Quantizes x dynamically per-row, uses tensorwise weight scale.
+    Processes scaling in chunks to avoid materializing large float32 tensors.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
+        )
+
+    weight = weight.to(device=x.device).contiguous()
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
+            f"for weight shape {tuple(weight.shape)}"
+        )
+
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+            )
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Quantize input per-row
+    x_8, x_scale = quantize_int8_rowwise(x_2d)
+
+    # Compute: x_8 @ weight.T using fast int8 matmul when shape constraints allow it.
+    # weight is [N, K], we need [K, N] for matmul so transpose
+    result = _int8_matmul_accumulate(x_8, weight.T.contiguous())
+
+    # Scale back efficiently: result * (weight_scale * x_scale)
+    # Process in chunks to avoid materializing large float32 tensor
+    # which causes OOM for large models
+
+    m, n = result.shape
+    chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))  # Estimate safe chunk size
+
+    weight_scale = weight_scale.reshape(1, -1)
+    scaled_parts = []
+    for i in range(0, m, chunk_size):
+        end_i = min(i + chunk_size, m)
+        chunk = result[i:end_i].float()
+
+        # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
+        chunk_scales = x_scale[i:end_i].to(device=chunk.device, dtype=torch.float32) * weight_scale
+        chunk_scaled = chunk * chunk_scales
+
+        # Convert to output dtype immediately to free memory
+        chunk_scaled = chunk_scaled.to(out_dtype)
+        scaled_parts.append(chunk_scaled)
+
+    result = torch.cat(scaled_parts, dim=0)
+
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
+
+    return result.reshape(*orig_shape[:-1], weight.shape[0])
+
+
+# =============================================================================
+# torch.library Custom Op Definitions — INT8 Tensor-wise
+# =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_tensorwise", mutates_args=())
+def _op_quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_tensorwise.register_fake
+def _op_quantize_int8_tensorwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_rowwise", mutates_args=())
+def _op_quantize_int8_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_rowwise.register_fake
+def _op_quantize_int8_rowwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty(*x.shape[:-1], 1, dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_convrot_weight", mutates_args=())
+def _op_quantize_int8_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"weight": weight, "group_size": group_size}
+    impl = registry.get_implementation("quantize_int8_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_convrot_weight.register_fake
+def _op_quantize_int8_convrot_weight_fake(weight, group_size):
+    q = torch.empty_like(weight, dtype=torch.int8)
+    scale = torch.empty(*weight.shape[:-1], 1, dtype=torch.float32, device=weight.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_convrot_weight", mutates_args=())
+def _op_dequantize_int8_convrot_weight(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size}
+    impl = registry.get_implementation("dequantize_int8_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_convrot_weight.register_fake
+def _op_dequantize_int8_convrot_weight_fake(q, scale, group_size):
+    return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_convrot_weight_dtype", mutates_args=())
+def _op_dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int8_convrot_weight_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_convrot_weight_dtype.register_fake
+def _op_dequantize_int8_convrot_weight_dtype_fake(q, scale, group_size, output_dtype_code):
+    return torch.empty_like(q, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
+def _op_dequantize_int8_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale}
+    impl = registry.get_implementation("dequantize_int8_simple", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_simple.register_fake
+def _op_dequantize_int8_simple_fake(q, scale):
+    return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple_dtype", mutates_args=())
+def _op_dequantize_int8_simple_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int8_simple_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_simple_dtype.register_fake
+def _op_dequantize_int8_simple_dtype_fake(q, scale, output_dtype_code):
+    return torch.empty_like(q, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear", mutates_args=())
+def _op_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+    }
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_int8_linear.register_fake
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)

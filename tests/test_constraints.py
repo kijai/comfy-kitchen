@@ -333,3 +333,45 @@ class TestIntegrationWithBackends:
             {"x": x_2d, "per_tensor_scale": scale},
         )
         assert result.success is True
+
+
+class TestINT8Constraints:
+    """Tests for INT8 specific constraints."""
+
+    def test_int8_linear_shape_constraint(self, device):
+        """Test that int8_linear requires at least 2D input on CUDA backend."""
+        if device != "cuda":
+            pytest.skip("Test requires CUDA device")
+
+        backends = ck.list_backends()
+        cuda_status = backends.get("cuda", {})
+        if not cuda_status.get("available", False):
+            pytest.skip(f"CUDA backend is unavailable: {cuda_status.get('unavailable_reason')}")
+
+        x_1d = torch.randn(32, dtype=torch.float16, device=device)
+        weight = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device=device)
+        scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+        result = ck.registry.validate_backend_for_call(
+            "cuda",
+            "int8_linear",
+            {"x": x_1d, "weight": weight, "weight_scale": scale, "out_dtype": torch.float16},
+        )
+
+        assert result.success is False
+        assert "at least 2D" in str(result.failure_reason)
+
+    def test_int8_linear_dtype_constraint(self, device):
+        """Test that int8_linear requires int8 weight."""
+        x = torch.randn(16, 32, dtype=torch.float16, device=device)
+        weight_wrong = torch.randn(64, 32, dtype=torch.float16, device=device)
+        scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+        # Check eager backend which also has the int8 constraint for weight
+        result = ck.registry.validate_backend_for_call(
+            "eager",
+            "int8_linear",
+            {"x": x, "weight": weight_wrong, "weight_scale": scale},
+        )
+        assert result.success is False
+        assert "torch.int8" in str(result.failure_reason)

@@ -4,6 +4,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 project(comfy_kitchen_cuda LANGUAGES CXX CUDA)
+
+# Enable compiler launchers only after CMake identifies the host and CUDA
+# compilers. This keeps ccache out of the MSVC/NVCC detection probes on
+# Windows, while still wrapping all target compilation commands.
+if(DEFINED COMFY_CXX_COMPILER_LAUNCHER)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${COMFY_CXX_COMPILER_LAUNCHER}")
+    message(STATUS "C++ compiler launcher: ${CMAKE_CXX_COMPILER_LAUNCHER}")
+endif()
+if(DEFINED COMFY_CUDA_COMPILER_LAUNCHER)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${COMFY_CUDA_COMPILER_LAUNCHER}")
+    message(STATUS "CUDA compiler launcher: ${CMAKE_CUDA_COMPILER_LAUNCHER}")
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 
 if(MSVC)
@@ -105,10 +118,18 @@ set(CUDA_SOURCES
     ops/quantize_nvfp4.cu
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
+    ops/cublas_gemm_int8.cu
+    ops/cutlass_gemm_int8.cu
+    ops/turing_int8.cu
+    ops/int8_linear.cu
+    ops/convrot_w4a4.cu
+    ops/turing_int4.cu
     ops/apply_rope.cu
+    ops/rms_rope.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
+    ops/adaln.cu
     sage_attention/quant_v_fp8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu
@@ -135,12 +156,39 @@ set(CPP_SOURCES
     dlpack_bindings.cpp
 )
 
+# Keep CUDA compilation independent of the Python extension target. The
+# kernels consume CUDA, DLPack, and project headers only, so a compiler cache
+# can reuse their fatbin objects across CPython wheel builds. _C remains the
+# only Python-facing shared library.
+add_library(comfy_kitchen_cuda_kernels OBJECT ${CUDA_SOURCES})
+target_compile_options(comfy_kitchen_cuda_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>
+)
+target_include_directories(comfy_kitchen_cuda_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+# CUTLASS (header-only) for the near-peak INT8 GEMM. Vendored at
+# third_party/cutlass (or pass -DCOMFY_CUTLASS_DIR). Optional: without it the
+# CUTLASS op compiles to a stub and int8_linear falls back to cuBLAS.
+if(NOT DEFINED COMFY_CUTLASS_DIR)
+    set(COMFY_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/cutlass/include")
+endif()
+if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
+    message(STATUS "CUTLASS found: ${COMFY_CUTLASS_DIR}")
+    target_include_directories(comfy_kitchen_cuda_kernels PRIVATE ${COMFY_CUTLASS_DIR})
+    target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_CUTLASS)
+else()
+    message(STATUS "CUTLASS not found at ${COMFY_CUTLASS_DIR} - int8 GEMM uses cuBLAS only")
+endif()
+
 # Create the nanobind module
 # Python 3.12+: Use stable ABI (abi3) for forward compatibility with 3.13+
 # Python 3.10/3.11: Version-specific module (nanobind stable ABI requires 3.12+)
 if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
     message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
-    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO ${CPP_SOURCES} ${CUDA_SOURCES})
+    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO ${CPP_SOURCES})
     # Explicitly set abi3 suffix
     if(WIN32)
         set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
@@ -150,15 +198,12 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
     target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
 else()
     message(STATUS "Python ${Python_VERSION} detected - building version-specific wheel")
-    nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${CUDA_SOURCES})
+    nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES})
 endif()
 
-target_compile_definitions(_C PRIVATE NB_STATIC)
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
-# Set target properties
-target_compile_options(_C PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>
-)
+target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Include directories
 target_include_directories(_C PRIVATE

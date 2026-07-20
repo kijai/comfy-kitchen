@@ -1,4 +1,5 @@
 __all__ = [
+    "adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -8,21 +9,47 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "int8_linear",
+    "quantize_int8_rowwise",
+    "quantize_and_rotate_rowwise",
 ]
 
 # Try to import triton and register if available
+import torch
+
+from comfy_kitchen.constraints import (
+    ExactDims,
+    FunctionConstraints,
+    ParamConstraint,
+)
+from comfy_kitchen.registry import registry
+
 _TRITON_AVAILABLE = True
 _TRITON_ERROR = None
 
 try:
     import triton  # noqa: F401
+    from comfy_kitchen.backends.eager.quantization import (
+        quantize_and_rotate_rowwise as _eager_quantize_and_rotate_rowwise,
+    )
+    from comfy_kitchen.backends.eager.quantization import (
+        quantize_int8_rowwise as _eager_quantize_int8_rowwise,
+    )
 
+    from .adaln import adaln
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
+        int8_linear,
         quantize_mxfp8,
         quantize_nvfp4,
         quantize_per_tensor_fp8,
+    )
+    from .quantization import (
+        triton_quantize_and_rotate_rowwise as _triton_quantize_and_rotate_rowwise,
+    )
+    from .quantization import (
+        triton_quantize_rowwise as _triton_quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
@@ -30,20 +57,42 @@ except ImportError as e:
     _TRITON_ERROR = f"ImportError: {e!s}"
 
 
+if _TRITON_AVAILABLE:
+    def quantize_int8_rowwise(
+        x: torch.Tensor,
+        stochastic_rounding: int | None = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if stochastic_rounding is not None and stochastic_rounding > 0:
+            return _eager_quantize_int8_rowwise(x, stochastic_rounding=stochastic_rounding)
+        return _triton_quantize_int8_rowwise(x)
+
+    def quantize_and_rotate_rowwise(
+        x: torch.Tensor,
+        h: torch.Tensor,
+        group_size: int,
+        stochastic_rounding: int | None = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if stochastic_rounding is not None and stochastic_rounding > 0:
+            return _eager_quantize_and_rotate_rowwise(
+                x, h, group_size, stochastic_rounding=stochastic_rounding
+            )
+        return _triton_quantize_and_rotate_rowwise(x, h, group_size)
+
+
 def _build_constraints() -> dict:
-    import torch
-
-    from comfy_kitchen.constraints import (
-        ExactDims,
-        FunctionConstraints,
-        ParamConstraint,
-    )
-
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     return {
+        "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -114,6 +163,34 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
         ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "weight_scale": ParamConstraint(dtypes=standard_floats),
+                "out_dtype": ParamConstraint(dtypes=standard_floats),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=triton_devices,
+            min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=triton_devices,
+        ),
+        "quantize_and_rotate_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "H": ParamConstraint(dtypes=standard_floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=triton_devices,
+        ),
         "apply_rope_split_half1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -133,10 +210,6 @@ def _build_constraints() -> dict:
 
 
 def _register():
-    import torch
-
-    from comfy_kitchen.registry import registry
-
     if not _TRITON_AVAILABLE:
         registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
         return

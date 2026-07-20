@@ -19,6 +19,7 @@
 
 #include <cstdint>
 
+#include <cuda.h>
 #include <cuda_fp8.h>
 #if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>

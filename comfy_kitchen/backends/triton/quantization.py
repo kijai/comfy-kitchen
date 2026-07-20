@@ -22,6 +22,8 @@ from comfy_kitchen.float_utils import (
     F8_E5M2_MAX,
     ceil_div,
 )
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -647,7 +649,7 @@ def quantize_mxfp8_kernel_tl(
 
             # Compute exponent: round up to next power of 2
             log2_ratio = tl.log2(scale_ratio)
-            exp_unbiased = tl.math.ceil(log2_ratio).to(tl.int32)
+            exp_unbiased = tl.ceil(log2_ratio).to(tl.int32)
             exp_biased = exp_unbiased + 127  # E8M0 bias
 
             # Clamp to valid E8M0 range [0, 254] (255 is NaN)
@@ -758,3 +760,344 @@ def quantize_mxfp8(
     swizzled_scales = swizzled_scales.view(torch.float8_e8m0fnu)
 
     return output, swizzled_scales
+# =============================================================================
+# INT8 Tensor-wise Quantization (from dxqb/OneTrainer & ComfyUI-Flux2-INT8)
+# =============================================================================
+# Single scale per tensor + per-row activation scaling.
+# Fuses dequantization and bias addition.
+
+@triton.jit
+def _quantize_rowwise_kernel(
+    x_ptr,      # Input pointer (FP16/BF16)
+    y_ptr,      # Output pointer (INT8)
+    s_ptr,      # Scale pointer (FP32)
+    n_elements, # Number of columns
+    block_size: tl.constexpr,
+    input_dtype_code: tl.constexpr,
+):
+    # Row index we are processing
+    row_idx = tl.program_id(0)
+
+    # Pointers to the start of the row
+    x_row_ptr = x_ptr + row_idx * n_elements
+    y_row_ptr = y_ptr + row_idx * n_elements
+
+    # 1. Compute Max Abs Value for the row
+    offsets = tl.arange(0, block_size)
+    mask = offsets < n_elements
+
+    # Load data
+    x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0)
+
+    # Absolute value
+    abs_x = tl.abs(x)
+
+    # Reduction to find max
+    max_val = tl.max(abs_x, axis=0)
+
+    # 2. Compute Scale
+    scale = tl.maximum(max_val / 127.0, 1e-30)
+
+    # 3. Quantize
+    if input_dtype_code == 1:
+        q_f = (x / scale.to(tl.float16)).to(tl.float16)
+    elif input_dtype_code == 2:
+        q_f = (x / scale.to(tl.bfloat16)).to(tl.bfloat16)
+    else:
+        q_f = x / scale
+
+    # Round and Clamp
+    q_i = tl.clamp(libdevice.rint(q_f.to(tl.float32)), -128.0, 127.0).to(tl.int32)
+
+    # 4. Store
+    tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
+    tl.store(s_ptr + row_idx, scale.to(tl.float32))
+
+def triton_quantize_rowwise(x: torch.Tensor):
+    """
+    Input: [Batch, Dim] (float16/bfloat16/float32)
+    Output: [Batch, Dim] (int8), [Batch, 1] (float32)
+    """
+    rows, cols = x.shape
+    y = torch.empty_like(x, dtype=torch.int8)
+    s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
+
+    input_dtype_code = 1 if x.dtype == torch.float16 else 2 if x.dtype == torch.bfloat16 else 0
+
+    # Heuristic for block size
+    block_size = triton.next_power_of_2(cols)
+    if block_size < 128:
+        block_size = 128
+
+    grid = (rows,)
+    _quantize_rowwise_kernel[grid](
+        x,
+        y,
+        s,
+        cols,
+        block_size=block_size,
+        input_dtype_code=input_dtype_code,
+    )
+    return y, s
+
+
+def triton_quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decoupled online activation rotation + row-wise quantization.
+
+    Args:
+        x: Input unrotated activation tensor [M, K].
+        h: Pre-built normalized Hadamard matrix [group_size, group_size].
+        group_size: ConvRot group size.
+
+    Returns:
+        Tuple of (rotated_quantized_x_int8, row_scales).
+    """
+    rotated_x = _rotate_activation(x, h, group_size)
+    return triton_quantize_rowwise(rotated_x)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
+        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['m', 'n', 'k'],
+)
+@triton.jit
+def _int8_matmul_dequant_kernel(
+    # Pointers
+    a_ptr, b_ptr, c_ptr,
+    a_scale_ptr, b_scale_ptr, bias_ptr,
+    # Matrix Dimensions
+    m, n, k,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Meta-parameters
+    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    group_size_m: tl.constexpr,
+    has_bias: tl.constexpr
+):
+    """
+    Computes: C = ((A * B) * (scale_a * scale_b)) + bias
+    A: [m, k] int8
+    B: [n, k] int8 (Transposed physically or logically via strides)
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(m, block_m)
+    num_pid_n = tl.cdiv(n, block_n)
+    num_pid_in_group = group_size_m * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+    pid_m = first_pid_m + (pid % actual_group_size_m)
+    pid_n = (pid % num_pid_in_group) // actual_group_size_m
+
+    # 1. Prepare Pointers for A and B
+    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
+    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+    offs_k = tl.arange(0, block_k)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # 2. Main Loop (Accumulate in Int32)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+
+    for k_idx in range(0, tl.cdiv(k, block_k)):
+        # Load chunks
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
+
+        # Matrix Multiply
+        accumulator += tl.dot(a, b)
+
+        # Advance pointers
+        a_ptrs += block_k * stride_ak
+        b_ptrs += block_k * stride_bk
+
+    # 3. Fused Epilogue (Dequantize & Bias)
+    scale_a = tl.load(a_scale_ptr + offs_am) # Vector [BLOCK_M]
+    scale_b = tl.load(b_scale_ptr)
+
+    c = accumulator.to(tl.float32)
+    total_scale = scale_a[:, None] * scale_b
+    c = c * total_scale
+
+    if has_bias:
+        bias = tl.load(bias_ptr + offs_bn) # Vector [BLOCK_N]
+        c = c + bias[None, :]
+
+    # 4. Store Result
+    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
+        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['m', 'n', 'k'],
+)
+@triton.jit
+def _int8_matmul_dequant_per_row_kernel(
+    # Pointers
+    a_ptr, b_ptr, c_ptr,
+    a_scale_ptr, b_scale_ptr, bias_ptr,
+    # Matrix Dimensions
+    m, n, k,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Meta-parameters
+    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    group_size_m: tl.constexpr,
+    has_bias: tl.constexpr
+):
+    """
+    Computes: C = ((A * B) * (scale_a[:, None] * scale_b[None, :])) + bias
+    A: [m, k] int8, scale_a: [m, 1] per-row activation scales
+    B: [n, k] int8, scale_b: [n, 1] per-row weight scales
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(m, block_m)
+    num_pid_n = tl.cdiv(n, block_n)
+    num_pid_in_group = group_size_m * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+    pid_m = first_pid_m + (pid % actual_group_size_m)
+    pid_n = (pid % num_pid_in_group) // actual_group_size_m
+
+    # 1. Prepare Pointers for A and B
+    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
+    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+    offs_k = tl.arange(0, block_k)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # 2. Main Loop (Accumulate in Int32)
+    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
+
+    for k_idx in range(0, tl.cdiv(k, block_k)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
+        accumulator += tl.dot(a, b)
+        a_ptrs += block_k * stride_ak
+        b_ptrs += block_k * stride_bk
+
+    # 3. Fused Epilogue (Dequantize & Bias)
+    scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
+    scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
+
+    c = accumulator.to(tl.float32)
+    total_scale = scale_a[:, None] * scale_b[None, :]
+    c = c * total_scale
+
+    if has_bias:
+        bias = tl.load(bias_ptr + offs_bn)
+        c = c + bias[None, :]
+
+    # 4. Store Result
+    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 linear layer using fused Triton kernel.
+
+    Quantizes x dynamically per-row, uses tensorwise or per-channel weight scale.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    m, k = x_2d.shape
+    n = weight.shape[0]
+
+    # Quantize input per-row using fused or normal quantization kernel
+    if convrot:
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x_rotated = _rotate_activation(x_2d, h, convrot_groupsize)
+        x_int8, x_scale = triton_quantize_rowwise(x_rotated)
+    else:
+        x_int8, x_scale = triton_quantize_rowwise(x_2d)
+
+    output = torch.empty((m, n), device=x.device, dtype=out_dtype)
+
+    is_per_channel = False
+    if not isinstance(weight_scale, torch.Tensor):
+        weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
+    elif weight_scale.numel() == 1:
+        weight_scale = weight_scale.reshape(1)
+    else:
+        is_per_channel = True
+        weight_scale = weight_scale.reshape(n).contiguous()
+
+    has_bias = bias is not None
+    bias_ptr = bias if has_bias else x
+
+    def grid(meta):
+        return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
+
+    if is_per_channel:
+        _int8_matmul_dequant_per_row_kernel[grid](
+            a_ptr=x_int8,
+            b_ptr=weight,
+            c_ptr=output,
+            a_scale_ptr=x_scale,
+            b_scale_ptr=weight_scale,
+            bias_ptr=bias_ptr,
+            m=m, n=n, k=k,
+            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
+            stride_cm=output.stride(0), stride_cn=output.stride(1),
+            has_bias=has_bias
+        )
+    else:
+        _int8_matmul_dequant_kernel[grid](
+            a_ptr=x_int8,
+            b_ptr=weight,
+            c_ptr=output,
+            a_scale_ptr=x_scale,
+            b_scale_ptr=weight_scale,
+            bias_ptr=bias_ptr,
+            m=m, n=n, k=k,
+            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
+            stride_cm=output.stride(0), stride_cn=output.stride(1),
+            has_bias=has_bias
+        )
+
+    return output.reshape(*orig_shape[:-1], n)

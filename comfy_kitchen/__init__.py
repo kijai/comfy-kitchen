@@ -6,6 +6,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
+from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -16,10 +17,15 @@ from .float_utils import from_blocked, swap_nibbles, to_blocked
 
 # Import registry and exceptions
 from .registry import registry
-
-__version__ = "0.1.0"
+from .tensor.convrot_w4a4 import (
+    convrot_w4a4_linear,
+    dequantize_convrot_w4a4_weight,
+    quantize_convrot_w4a4_weight,
+)
 
 __all__ = [
+    # Normalization
+    "adaln",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -28,16 +34,27 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "quantize_svdquant_w4a4",
+    "quantize_convrot_w4a4_weight",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
+    "dequantize_int8_simple",
     # Fused matmul
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
+    "convrot_w4a4_linear",
+    "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
+    "int8_linear",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
     "apply_rope_split_half1",
+    "rms_rope",
+    "rms_rope1",
+    "rms_rope_split_half",
+    "rms_rope_split_half1",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -63,6 +80,26 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused Adaptive Layer Normalization: layernorm(x) * (1 + scale) + shift.
+
+    Args:
+        x: Input tensor of any shape (..., D)
+        scale: Modulation scale, broadcastable to x's shape
+        shift: Modulation shift, broadcastable to x's shape
+        eps: LayerNorm epsilon
+
+    Returns:
+        Normalized and modulated tensor with the same shape as x
+    """
+    return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
 
 
 def quantize_per_tensor_fp8(
@@ -398,6 +435,70 @@ def apply_rope(
     return torch.ops.comfy_kitchen.apply_rope(xq, xk, freqs_cis)
 
 
+def rms_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-head RMSNorm followed by interleaved RoPE to query and key tensors.
+
+    Interleaved layout: pair k uses adjacent elements [2k, 2k+1].
+
+    Args:
+        q: Query tensor.
+        k: Key tensor with the same shape as q.
+        freqs_cis: Precomputed frequency tensor.
+        q_scale: Per-dimension RMSNorm scale for q.
+        k_scale: Optional per-dimension RMSNorm scale for k. Defaults to q_scale.
+        epsilon: RMSNorm numerical-stability epsilon.
+
+    Returns:
+        Tuple of normalized and rotated (query, key) tensors.
+    """
+    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+
+
+def rms_rope1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply per-head RMSNorm followed by interleaved RoPE to a single tensor."""
+    return torch.ops.comfy_kitchen.rms_rope1(x, freqs_cis, scale, epsilon)
+
+
+def rms_rope_split_half(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-head RMSNorm and split-half RoPE to query and key tensors.
+
+    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    """
+    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon)
+
+
+def rms_rope_split_half1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Apply per-head RMSNorm followed by split-half RoPE to a single tensor.
+
+    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    """
+    return torch.ops.comfy_kitchen.rms_rope_split_half1(x, freqs_cis, scale, epsilon)
+
+
 def apply_rope1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -499,6 +600,75 @@ def sage_sdpa(
     return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k,
                       pv_fp16_accum=pv_fp16_accum, qk_quant_gran=qk_quant_gran,
                       free_qkv=free_qkv)
+
+
+def quantize_int8_tensorwise(
+    x: torch.Tensor,
+    scale: torch.Tensor | float | str | None = None,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale."""
+    kwargs = {"x": x, "scale": scale, "stochastic_rounding": stochastic_rounding}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def quantize_int8_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales."""
+    kwargs = {"x": x, "stochastic_rounding": stochastic_rounding}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale."""
+    return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale)
+
+
+def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+    return _mm_int8(a, b)
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 linear layer dynamically quantized.
+
+    Args:
+        x: Input tensor.
+        weight: INT8 weight tensor.
+        weight_scale: Scalar weight scale.
+        bias: Optional bias.
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+
+    Returns:
+        Result tensor.
+    """
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+    }
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 # =============================================================================

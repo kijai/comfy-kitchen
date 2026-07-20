@@ -1,27 +1,70 @@
 __all__ = [
+    "adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
     "apply_rope_split_half1",
+    "rms_rope",
+    "rms_rope1",
+    "rms_rope_split_half",
+    "rms_rope_split_half1",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "dequantize_int8_simple",
+    "dequantize_int8_simple_dtype",
+    "dequantize_int8_convrot_weight",
+    "dequantize_int8_convrot_weight_dtype",
+    "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
+    "convrot_w4a4_linear",
+    "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "quantize_convrot_w4a4_weight",
+    "quantize_int8_rowwise",
+    "quantize_int8_convrot_weight",
+    "quantize_and_rotate_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_svdquant_w4a4",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
+    "int8_linear",
 ]
 
+import torch
+
+from comfy_kitchen.constraints import (
+    ExactDims,
+    FunctionConstraints,
+    ParamConstraint,
+)
+from comfy_kitchen.registry import registry
+
+from .adaln import adaln
 from .awq import gemv_awq_w4a16
+from .convrot_w4a4 import (
+    convrot_w4a4_linear,
+    dequantize_convrot_w4a4_weight,
+    prepare_int4_weight_for_int8_linear,
+    quantize_convrot_w4a4_weight,
+)
 from .quantization import (
+    dequantize_int8_convrot_weight,
+    dequantize_int8_convrot_weight_dtype,
+    dequantize_int8_simple,
+    dequantize_int8_simple_dtype,
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    int8_linear,
+    quantize_and_rotate_rowwise,
+    quantize_int8_convrot_weight,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
@@ -29,23 +72,33 @@ from .quantization import (
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
 )
-from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
+from .rope import (
+    apply_rope,
+    apply_rope1,
+    apply_rope_split_half,
+    apply_rope_split_half1,
+    rms_rope,
+    rms_rope1,
+    rms_rope_split_half,
+    rms_rope_split_half1,
+)
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
 def _build_constraints() -> dict:
-    import torch
-
-    from comfy_kitchen.constraints import (
-        ExactDims,
-        FunctionConstraints,
-        ParamConstraint,
-    )
-
     all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -137,6 +190,74 @@ def _build_constraints() -> dict:
             },
             default_devices=all_devices,
         ),
+        "rms_rope": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope_split_half": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "q_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+                "k_scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(6),),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
         "apply_rope_split_half1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -181,6 +302,43 @@ def _build_constraints() -> dict:
             },
             default_devices=all_devices,
         ),
+        "quantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "scales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "convrot_w4a4_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "qweight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
+            },
+            default_devices=all_devices,
+        ),
+        "prepare_int4_weight_for_int8_linear": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            },
+            default_devices=all_devices,
+        ),
         "gemv_awq_w4a16": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -194,6 +352,82 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
     }
+
+    out["quantize_int8_tensorwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "scale": ParamConstraint(dtypes=scale_values),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int8_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_and_rotate_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "H": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int8_convrot_weight"] = FunctionConstraints(
+        params={
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_convrot_weight"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_convrot_weight_dtype"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_simple"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_simple_dtype"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["int8_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
+            "convrot": ParamConstraint(dtypes=frozenset({bool})),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
 
     if hasattr(torch, "float8_e8m0fnu"):
         out["quantize_mxfp8"] = FunctionConstraints(
@@ -242,8 +476,6 @@ def _build_constraints() -> dict:
 
 
 def _register():
-    from comfy_kitchen.registry import registry
-
     registry.register(
         name="eager",
         module=__import__(__name__, fromlist=__all__),
