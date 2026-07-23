@@ -136,7 +136,7 @@ def sage_sdpa(
     free_qkv : bool  — release the bf16 q/k/v storage in place (resize_(0))
         between quantisation and attention to cut peak VRAM by ~0.5x(q+k+v).
         ONLY set this when the caller does not use q/k/v after attention (true
-        for standard attention forwards). Currently applies to per-thread quant.
+        for standard attention forwards).
 
     Returns
     -------
@@ -195,7 +195,7 @@ def sage_sdpa(
         except Exception:
             pass
 
-    if free_qkv and qk_quant_gran == 0:
+    if free_qkv:
         # Low-peak path: allocate just-in-time and free each bf16 input right
         # after quantising it, interleaved — V first, then Q/K — so the peak
         # never holds bf16 q/k/v together with all the quantized copies + output.
@@ -213,11 +213,11 @@ def sage_sdpa(
         k_int8 = torch.empty_like(k, dtype=torch.int8)
         q_scale, k_scale = _scale(h_q, q_sc_n), _scale(h_k, k_sc_n)
         kmp, kmd_p, _kms, _kmd = _alloc_km()
-        _C._quant_qk_per_thread_int8(
+        _C._quant_qk_int8(
             _wrap_for_dlpack(q), _wrap_for_dlpack(q_int8), _wrap_for_dlpack(q_scale),
             _wrap_for_dlpack(k), _wrap_for_dlpack(k_int8), _wrap_for_dlpack(k_scale),
             blkq, warpq, blkk, warpk, input_dtype_code, stream_ptr,
-            int(smooth_k), kmp, kmd_p)
+            int(smooth_k), kmp, kmd_p, qk_quant_gran)
         _free(q)
         _free(k)
 

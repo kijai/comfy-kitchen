@@ -530,6 +530,109 @@ __global__ __launch_bounds__(256) void quant_per_warp_kernel(
   }
 }
 
+// Vectorized single-pass variant for 16-bit dtypes: 16-byte loads, the tile
+// held in registers across the block-max reduction (one global read instead of
+// two), 8-byte int8 stores. Requires C % 8 == 0 and C <= 256 (register budget:
+// WARP_ROWS/8 uint4 per thread at C = 256).
+template <typename T, int WARP_ROWS>
+__global__ __launch_bounds__(256) void quant_per_warp_vec_kernel(
+    const T *__restrict__ in, int8_t *__restrict__ out,
+    float *__restrict__ sc_buf, const float *__restrict__ km, int L, int C,
+    int H, int num_wb) {
+  static_assert(sizeof(T) == 2, "vectorized per-warp quant expects 16-bit T");
+  constexpr int VEC = 8;                                  // 8 x 16-bit = 16 B
+  constexpr int MAX_VPT = WARP_ROWS * 256 / (VEC * 256);  // vectors/thread at C=256
+  const int g = blockIdx.x;
+  const int h = blockIdx.y, b = blockIdx.z;
+  const int row0 = g * WARP_ROWS;
+  const int64_t bh = ((int64_t)b * H + h) * (int64_t)L * C;
+  const float *km_bh = km ? km + ((int64_t)b * H + h) * C : nullptr;
+  const int tid = threadIdx.x;
+  const int nvec = WARP_ROWS * C / VEC;
+  const int cvec = C / VEC;
+
+  uint4 vals[MAX_VPT];
+  float mx = 0.f;
+#pragma unroll
+  for (int i = 0; i < MAX_VPT; ++i) {
+    const int vidx = tid + i * 256;
+    if (vidx >= nvec)
+      break;
+    const int n = row0 + vidx / cvec;
+    const int c0 = (vidx % cvec) * VEC;
+    uint4 pkt = make_uint4(0u, 0u, 0u, 0u);
+    if (n < L)
+      pkt = *reinterpret_cast<const uint4 *>(in + bh + (int64_t)n * C + c0);
+    vals[i] = pkt;
+    const T *e = reinterpret_cast<const T *>(&pkt);
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+      float v = static_cast<float>(e[j]);
+      if (km_bh)
+        v -= __ldg(km_bh + c0 + j);
+      mx = fmaxf(mx, fabsf(v));
+    }
+  }
+
+  // block-wide max reduction (256 threads = 8 warps)
+  __shared__ float smem[8];
+  mx = warp_reduce_fmax(mx);
+  if ((tid & 31) == 0)
+    smem[tid >> 5] = mx;
+  __syncthreads();
+  if (tid == 0) {
+    float v = smem[0];
+#pragma unroll
+    for (int i = 1; i < 8; i++)
+      v = fmaxf(v, smem[i]);
+    smem[0] = v;
+  }
+  __syncthreads();
+  const float sc = smem[0] / 127.f + 1e-7f;
+  if (tid == 0)
+    sc_buf[((int64_t)b * H + h) * num_wb + g] = sc;
+
+#pragma unroll
+  for (int i = 0; i < MAX_VPT; ++i) {
+    const int vidx = tid + i * 256;
+    if (vidx >= nvec)
+      break;
+    const int n = row0 + vidx / cvec;
+    if (n >= L)
+      continue;
+    const int c0 = (vidx % cvec) * VEC;
+    const T *e = reinterpret_cast<const T *>(&vals[i]);
+    int8_t o8[VEC];
+#pragma unroll
+    for (int j = 0; j < VEC; ++j) {
+      float v = static_cast<float>(e[j]);
+      if (km_bh)
+        v -= __ldg(km_bh + c0 + j);
+      o8[j] = quant_int8(v, sc);
+    }
+    *reinterpret_cast<uint2 *>(out + bh + (int64_t)n * C + c0) =
+        *reinterpret_cast<uint2 *>(o8);
+  }
+}
+
+// Picks the vectorized kernel when the layout allows it (16-bit dtype,
+// C a multiple of 8 and within the register budget), else the scalar one.
+template <typename T, int WARP_ROWS>
+void launch_per_warp_one(const T *in, int8_t *out, float *sc, const float *km,
+                         int L, int C, int H, int num_wb, int B,
+                         cudaStream_t stream) {
+  dim3 grid(num_wb, H, B);
+  if constexpr (sizeof(T) == 2) {
+    if ((C & 7) == 0 && C <= 256) {
+      quant_per_warp_vec_kernel<T, WARP_ROWS>
+          <<<grid, 256, 0, stream>>>(in, out, sc, km, L, C, H, num_wb);
+      return;
+    }
+  }
+  quant_per_warp_kernel<T, WARP_ROWS>
+      <<<grid, 256, 0, stream>>>(in, out, sc, km, L, C, H, num_wb);
+}
+
 } // namespace
 
 // smooth_k == 1 → compute km into km_scratch, pass to quant_k_kernel.
@@ -669,19 +772,17 @@ extern "C" void launch_quant_qk_per_warp_int8(
   }
 
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
-    dim3 gq(num_wb_q, H_q, B);
     if (WARPQ == 16) {
-      quant_per_warp_kernel<T, 16><<<gq, 256, 0, stream>>>(
-          (const T *)q, (int8_t *)q_int8, (float *)q_scale, nullptr, Lq, C, H_q,
-          num_wb_q);
+      launch_per_warp_one<T, 16>((const T *)q, (int8_t *)q_int8,
+                                 (float *)q_scale, nullptr, Lq, C, H_q,
+                                 num_wb_q, B, stream);
     } else {
-      quant_per_warp_kernel<T, 32><<<gq, 256, 0, stream>>>(
-          (const T *)q, (int8_t *)q_int8, (float *)q_scale, nullptr, Lq, C, H_q,
-          num_wb_q);
+      launch_per_warp_one<T, 32>((const T *)q, (int8_t *)q_int8,
+                                 (float *)q_scale, nullptr, Lq, C, H_q,
+                                 num_wb_q, B, stream);
     }
-    dim3 gk(num_wb_k, H_kv, B);
-    quant_per_warp_kernel<T, 64><<<gk, 256, 0, stream>>>(
-        (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, Lk, C, H_kv,
-        num_wb_k);
+    launch_per_warp_one<T, 64>((const T *)k, (int8_t *)k_int8,
+                               (float *)k_scale, km_ptr, Lk, C, H_kv, num_wb_k,
+                               B, stream);
   });
 }

@@ -78,7 +78,7 @@ def _per_thread_int8_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """INT8 per-thread quantization for Q and K (contiguous HND layout).
 
-    Component-level test helper wrapping ``_C._quant_qk_per_thread_int8``.
+    Component-level test helper wrapping ``_C._quant_qk_int8``.
     """
     from comfy_kitchen.backends.cuda import _C, _wrap_for_dlpack
     from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
@@ -107,7 +107,7 @@ def _per_thread_int8_cuda(
         raise TypeError("q and k must be fp32, fp16 or bf16, same dtype")
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    _C._quant_qk_per_thread_int8(
+    _C._quant_qk_int8(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(q_int8),
         _wrap_for_dlpack(q_scale),

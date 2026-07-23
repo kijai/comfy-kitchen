@@ -685,11 +685,12 @@ void quant_v_fp8(
         input_dtype_code, v_scale_max, stream);
 }
 
-// Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
+// Nanobind wrapper: INT8 Q/K quant (contiguous HND layout);
+// qk_quant_gran selects per-thread (0) or per-warp (1) scales.
 // smooth_k: 1 = fuse K-mean computation + subtraction into the kernel.
 // km_scratch_ptr / km_done_ptr: device pointers for scratch buffers
 // (pre-zeroed by the caller).  Ignored when smooth_k == 0.
-void quant_qk_per_thread_int8(
+void quant_qk_int8(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> q_int8,
     nb::ndarray<nb::device::cuda> q_scale,
@@ -701,13 +702,16 @@ void quant_qk_per_thread_int8(
     uintptr_t stream_ptr,
     int smooth_k = 0,
     uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0)
+    uintptr_t km_done_ptr = 0,
+    int qk_quant_gran = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4) {
-        throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
+        throw std::runtime_error("quant_qk_int8: q and k must be 4D [B,H,L,D]");
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_quant_qk_per_thread_int8(
+    auto launch = (qk_quant_gran == 1) ? launch_quant_qk_per_warp_int8
+                                       : launch_quant_qk_per_thread_int8;
+    launch(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
         smooth_k,
@@ -2887,8 +2891,8 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"),
           nb::arg("v_scale_max") = 448.0f);
 
-    m.def("_quant_qk_per_thread_int8", &quant_qk_per_thread_int8,
-          "INT8 per-thread quant for Q and K (HND), same tiling as Triton quant_per_thread",
+    m.def("_quant_qk_int8", &quant_qk_int8,
+          "INT8 quant for Q and K (HND): per-thread (gran=0) or per-warp (gran=1)",
           nb::arg("q"),
           nb::arg("q_int8"),
           nb::arg("q_scale"),
@@ -2903,7 +2907,8 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"),
           nb::arg("smooth_k") = 0,
           nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0);
+          nb::arg("km_done_ptr") = 0,
+          nb::arg("qk_quant_gran") = 0);
 
     m.def("_sage_attn", &sage_attn,
           "SageAttention INT8 QK / FP8 V attention kernel",
