@@ -2157,6 +2157,39 @@ def w4a8_int8_linear(
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     bias_float = bias.float().contiguous() if bias is not None else None
 
+    # A DLPack capsule is consumed by the callee, so wrap per call site (a
+    # fallback from the gemv to the chunked path passes bias twice).
+    def wrap_bias():
+        return _wrap_for_dlpack(bias_float) if bias_float is not None else None
+
+    # Decode fast path: fused in-register dequant GEMV, no int8 workspace round-trip.
+    # Bit-exact with the chunked path (same rounded int8 grid and epilogue).
+    if (
+        _W4A8_CHUNKED
+        and m <= 8
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+        and group_size >= 16
+        and group_size % 16 == 0
+    ):
+        used = _C.w4a8_codebook_gemv(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            wrap_codebook(),
+            _wrap_for_dlpack(s_channel),
+            wrap_bias(),
+            _wrap_for_dlpack(out),
+            convrot_groupsize,
+            group_size,
+            output_dtype_code,
+            stream_ptr,
+        )
+        if used:
+            return out.reshape(*x.shape[:-1], n)
+
     chunked = (
         _W4A8_CHUNKED
         and correction is None
@@ -2176,7 +2209,7 @@ def w4a8_int8_linear(
                 _wrap_for_dlpack(s_rel.view(torch.uint8)),
                 wrap_codebook(),
                 _wrap_for_dlpack(s_channel),
-                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                wrap_bias(),
                 _wrap_for_dlpack(workspace),
                 _wrap_for_dlpack(out),
                 convrot_groupsize,
@@ -2202,7 +2235,7 @@ def w4a8_int8_linear(
                 wrap_codebook(),
                 _wrap_for_dlpack(s_channel),
                 _wrap_for_dlpack(xs.reshape(m)),
-                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                wrap_bias(),
                 _wrap_for_dlpack(workspace),
                 _wrap_for_dlpack(out),
                 group_size,
@@ -3676,3 +3709,4 @@ def _register():
 
 
 _register()
+
