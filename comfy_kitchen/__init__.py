@@ -5,6 +5,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends.cuda import sol_attn_chunked  # CUDA-only chunked-producer form of sol_attn
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -63,6 +64,7 @@ __all__ = [
     "na2d",
     "na3d",
     "sol_attn",
+    "sol_attn_chunked",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
