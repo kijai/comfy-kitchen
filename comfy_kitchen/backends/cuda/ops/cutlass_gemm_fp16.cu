@@ -1,0 +1,251 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * FP16 GEMM with FP16 accumulators via CUTLASS (EVT epilogue):
+ *   D[m,n] = A[m,k] @ B[n,k]^T (+ bias[n]) [+ residual fused as
+ *   D = resid + rscale[n] * (acc + bias)]
+ *
+ * On sm_120 the f32-accumulate HMMA issues at half the rate of the
+ * f16-accumulate form, so this trades full-K fp16 accumulation (the same
+ * numerics as torch's allow_fp16_accumulation / TensorRT's FP16 builder)
+ * for ~2x tensor-core throughput. Callers must only route here when the
+ * user has opted into fp16 accumulation. Tile configs benchmarked on the
+ * H3 VAE decoder shapes (M~1.8k, N 2k-16k, K 2k-8k); deep-K shapes use the
+ * lean stream-K swizzle. Returns false when no config can run; callers
+ * fall back to cuBLAS.
+ */
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+
+#ifdef COMFY_HAVE_CUTLASS
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
+#include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
+
+#include "cutlass_gemm_common.cuh"
+
+namespace {
+using namespace cute;
+using comfy_cutlass::ThreadblockSwizzleLeanStreamK;
+
+using half_t = cutlass::half_t;
+
+// Shared kernel plumbing for the fp16-accum GEMM variants: row-major A [M,K],
+// B given as [N,K] row-major read column-major, row-major D [M,N].
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename EVTD, typename ThreadblockSwizzle>
+struct Fp16GemmBase {
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using Inst = cutlass::gemm::GemmShape<16, 8, 16>;
+    static constexpr int EVTStages = 1;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        half_t, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 8,
+        half_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 8,
+        half_t, cutlass::layout::RowMajor, 8,
+        half_t, float,
+        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        TB, Warp, Inst, EVTD,
+        ThreadblockSwizzle,
+        NumStages, cutlass::arch::OpMultiplyAdd, EVTStages>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    template <typename Callback>
+    static bool launch(const half_t* A, const half_t* B, const Callback& cb,
+                       int M, int N, int K, cudaStream_t stream) {
+        return comfy_cutlass::launch_universal<Gemm>(
+            A, B, cb, M, N, K, stream);
+    }
+};
+
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct Fp16Gemm {
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, half_t, 8, 1>;
+    using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
+    // bias == nullptr broadcasts null_default(0) and is an identity add.
+    using Bias  = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, half_t, cute::Stride<_0, _1, int32_t>>;
+    using Add0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, half_t, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Add0, Accum, Bias>;
+    using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, half_t, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT0>;
+    using Base = Fp16GemmBase<TBM, TBN, TBK, WM, WN, WK, NumStages, EVTD, ThreadblockSwizzle>;
+
+    static bool run(const half_t* A, const half_t* B, const half_t* bias,
+                    half_t* D, int M, int N, int K, cudaStream_t stream) {
+        typename EVTD::Arguments cb{
+            { {}, {const_cast<half_t*>(bias), half_t(0), {_0{}, _1{}, N}}, {} },
+            {D, {int64_t(N), _1{}, int64_t(M) * N}} };
+        return Base::launch(A, B, cb, M, N, K, stream);
+    }
+};
+
+// D = resid + rscale[n] * (acc + bias[n]) -- a pre-norm block's addcmul.
+// The multiply and adds run in float; only loads/stores are half.
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct Fp16GemmResidual {
+    using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using Warp = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, half_t, 8, 1>;
+    using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
+    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, half_t, cute::Stride<_0, _1, int32_t>>;
+    using RScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, half_t, cute::Stride<_0, _1, int32_t>>;
+    using Resid  = cutlass::epilogue::threadblock::VisitorAuxLoad<ThreadMap, half_t, cute::Stride<int64_t, _1, int64_t>>;
+    using Add0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Add0, Accum, Bias>;
+    using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, RScale>;
+    using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, half_t, float, cutlass::FloatRoundStyle::round_to_nearest>;
+    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Resid>;
+    using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, half_t, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT2>;
+    using Base = Fp16GemmBase<TBM, TBN, TBK, WM, WN, WK, NumStages, EVTD, ThreadblockSwizzle>;
+
+    static bool run(const half_t* A, const half_t* B, const half_t* bias,
+                    const half_t* rscale, const half_t* resid,
+                    half_t* D, int M, int N, int K, cudaStream_t stream) {
+        typename EVTD::Arguments cb{
+            { { { {}, {const_cast<half_t*>(bias), half_t(0), {_0{}, _1{}, N}}, {} },
+                {const_cast<half_t*>(rscale), half_t(0), {_0{}, _1{}, N}}, {} },
+              {const_cast<half_t*>(resid), half_t(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
+            {D, {int64_t(N), _1{}, int64_t(M) * N}} };
+        return Base::launch(A, B, cb, M, N, K, stream);
+    }
+};
+
+// Tile configs benchmarked on sm_120 for the H3 decoder shapes (rankings hold
+// with weights streaming cold from DRAM and with the EVT epilogue attached);
+// 3 is stream-K for deep-K problems where plain data-parallel loses to cuBLAS.
+// select_fp16_config indexes THIS list; both epilogue variants' runner tables
+// are instantiated from it.
+using comfy_cutlass::TileConfig;
+using comfy_cutlass::ConfigList;
+using Fp16Configs = ConfigList<
+    TileConfig<128, 256, 32, 64, 64, 32, 3>,                                     // 0
+    TileConfig<128, 128, 32, 64, 64, 32, 4>,                                     // 1
+    TileConfig<256, 128, 32, 64, 64, 32, 3>,                                     // 2
+    TileConfig<128, 128, 32, 64, 64, 32, 4, 16, ThreadblockSwizzleLeanStreamK>>; // 3 (stream-K)
+
+int select_fp16_config(int n, int k) {
+    if (k > 4096) return 3;
+    if (n <= 3072) return 0;
+    if (n <= 8192) return 1;
+    return 0;
+}
+
+template <typename Launch>
+bool launch_fp16_heuristic(int n, int k, Launch launch) {
+    const int selected = select_fp16_config(n, k);
+    if (launch(selected)) return true;
+    for (int config = 0; config < Fp16Configs::size; ++config) {
+        if (config != selected && launch(config)) return true;
+    }
+    return false;
+}
+
+template <typename C>
+using PlainGemm = Fp16Gemm<C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages,
+                           typename C::ThreadblockSwizzle>;
+template <typename C>
+using ResidualGemm = Fp16GemmResidual<C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages,
+                                      typename C::ThreadblockSwizzle>;
+
+using Fp16Fn = bool (*)(const half_t*, const half_t*, const half_t*, half_t*, int, int, int, cudaStream_t);
+using Fp16ResidualFn = bool (*)(const half_t*, const half_t*, const half_t*, const half_t*,
+                                const half_t*, half_t*, int, int, int, cudaStream_t);
+
+template <typename... Cs>
+const Fp16Fn* fp16_runners(ConfigList<Cs...>) {
+    static const Fp16Fn runners[sizeof...(Cs)] = {&PlainGemm<Cs>::run...};
+    return runners;
+}
+
+template <typename... Cs>
+const Fp16ResidualFn* fp16_residual_runners(ConfigList<Cs...>) {
+    static const Fp16ResidualFn runners[sizeof...(Cs)] = {&ResidualGemm<Cs>::run...};
+    return runners;
+}
+
+bool dispatch_fp16(const half_t* A, const half_t* B, const half_t* bias,
+                   half_t* D, int M, int N, int K, cudaStream_t stream) {
+    // bias == nullptr is fine: VisitorRowBroadcast's EnableNullptr fallback
+    // broadcasts null_default (0), verified bitwise-identical to a plain store.
+    const Fp16Fn* runners = fp16_runners(Fp16Configs{});
+    return launch_fp16_heuristic(N, K, [&](int config) {
+        return runners[config](A, B, bias, D, M, N, K, stream);
+    });
+}
+
+bool dispatch_fp16_residual(const half_t* A, const half_t* B, const half_t* bias,
+                            const half_t* rscale, const half_t* resid,
+                            half_t* D, int M, int N, int K, cudaStream_t stream) {
+    const Fp16ResidualFn* runners = fp16_residual_runners(Fp16Configs{});
+    return launch_fp16_heuristic(N, K, [&](int config) {
+        return runners[config](A, B, bias, rscale, resid, D, M, N, K, stream);
+    });
+}
+
+// Shape gate shared by both entry points. A zero-K linear is the bias
+// broadcast, and the tile table is tuned for decoder-tile M (~2k); at DiT
+// sequence lengths cuBLAS wins. Both decline so the caller computes them.
+bool fp16_gemm_shape_ok(int64_t M, int64_t N, int64_t K) {
+    return K != 0 && K % 8 == 0 && N % 8 == 0 && M <= 4096;
+}
+
+}  // namespace
+
+extern "C" {
+
+bool launch_cutlass_fp16_linear(
+    const void* A, const void* B, const void* bias, void* D,
+    int64_t M, int64_t N, int64_t K, cudaStream_t stream)
+{
+    if (M == 0 || N == 0) return true;
+    if (!fp16_gemm_shape_ok(M, N, K)) return false;
+    return dispatch_fp16(
+        static_cast<const half_t*>(A), static_cast<const half_t*>(B),
+        static_cast<const half_t*>(bias), static_cast<half_t*>(D),
+        M, N, K, stream);
+}
+
+bool launch_cutlass_fp16_linear_residual(
+    const void* A, const void* B, const void* bias, const void* rscale,
+    const void* resid, void* D, int64_t M, int64_t N, int64_t K,
+    cudaStream_t stream)
+{
+    if (M == 0 || N == 0) return true;
+    if (!fp16_gemm_shape_ok(M, N, K)) return false;
+    // bias may be nullptr: the RowBroadcast visitor broadcasts null_default(0).
+    if (rscale == nullptr || resid == nullptr) return false;
+    return dispatch_fp16_residual(
+        static_cast<const half_t*>(A), static_cast<const half_t*>(B),
+        static_cast<const half_t*>(bias), static_cast<const half_t*>(rscale),
+        static_cast<const half_t*>(resid), static_cast<half_t*>(D),
+        M, N, K, stream);
+}
+
+}  // extern "C"
+
+#else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS.
+
+extern "C" bool launch_cutlass_fp16_linear(
+    const void*, const void*, const void*, void*,
+    int64_t, int64_t, int64_t, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_fp16_linear_residual(
+    const void*, const void*, const void*, const void*, const void*,
+    void*, int64_t, int64_t, int64_t, cudaStream_t) {
+    return false;
+}
+
+#endif

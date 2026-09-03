@@ -52,6 +52,8 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    "fp16_conv3d",
+    "group_norm_silu_pad3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -86,6 +88,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "fp16_linear",
     "int8_linear",
     "w4a8_int8_linear",
     # Positional encoding
@@ -274,6 +277,48 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def fp16_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """fp16-accumulate 3D convolution with bias and residual fused into the epilogue.
+
+    x is [N, C, D, H, W], weight [K, C, T, R, S], zero padding only (pre-pad
+    with group_norm_silu_pad3d, whose channels_last_3d output this consumes
+    directly). Same opt-in numerics as fp16_linear: accumulation in fp16, so
+    callers should gate on the user having chosen fp16 accumulation. The
+    residual, if given, must match the output shape. Shapes the fused kernel
+    declines (channels not a multiple of 8, launches too small to fill the
+    GPU) run torch's conv, i.e. cuDNN with fp32 accumulation.
+    """
+    stride = [stride] * 3 if isinstance(stride, int) else list(stride)
+    return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+
+
+def group_norm_silu_pad3d(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    num_groups: int = 32,
+    eps: float = 1e-6,
+    pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
+    silu: bool = True,
+) -> torch.Tensor:
+    """Per-frame GroupNorm, SiLU and causal 3D-conv padding in one pass.
+
+    x is [B, C, T, H, W]; statistics are taken per frame over (C/num_groups, H, W)
+    as in a GroupNorm applied to each frame separately. pad is
+    (left, right, top, bottom, front): reflect padding in space and zero
+    frames prepended in time, giving [B, C, T+front, H+top+bottom, W+left+right].
+    weight=None skips the norm (pad-only). The CUDA backend returns the result
+    in channels_last_3d, which cuDNN consumes without layout conversions.
+    """
+    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
 
 
 def rms_adaln(
@@ -868,6 +913,34 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _mm_int8(a, b)
 
 
+def fp16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FP16 linear with fp16 accumulators and an optional fused residual.
+
+    ``x @ weight.T + bias``, or ``residual + residual_scale * (x @ weight.T
+    + bias)`` (a pre-norm block's addcmul) fused into the GEMM epilogue.
+
+    Accumulates in fp16 -- the same numerics as
+    ``torch.backends.cuda.matmul.allow_fp16_accumulation`` -- so route here
+    only when the caller has opted into that mode. Backends without a fused
+    kernel fall back to a plain linear.
+    """
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "bias": bias,
+        "residual": residual,
+        "residual_scale": residual_scale,
+    }
+    impl = registry.get_implementation("fp16_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -877,6 +950,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -888,11 +965,18 @@ def int8_linear(
         out_dtype: Output dtype.
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
-        input_act: Optional elementwise activation applied to x before
-            quantization ("gelu_tanh", or None). When the fused ConvRot
-            quantizer handles the shape it is folded in, so an MLP's
-            ``linear(act(proj(x)))`` never writes act's output to HBM; every
-            other path applies it eagerly for identical results.
+        input_act: Optional activation applied to x before quantization
+            ("gelu_tanh", "swiglu", "rms_norm", "nan_to_num", or None). When
+            the fused ConvRot quantizer handles the shape it is folded in, so
+            an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
+            ``linear(rms_norm(x))`` never writes the intermediate to HBM;
+            every other path applies it eagerly for identical results.
+        input_act_weight: K-element norm weight, required for "rms_norm".
+        input_act_eps: Norm eps for "rms_norm".
+        residual: Optional [..., N] tensor; the result becomes
+            ``residual + residual_scale * linear(x)`` (a pre-norm block's
+            addcmul), fused into the GEMM epilogue where supported.
+        residual_scale: Per-channel [N] scale for the residual form.
 
     Returns:
         Result tensor.
@@ -908,6 +992,10 @@ def int8_linear(
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
         "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

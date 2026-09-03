@@ -27,6 +27,7 @@ import torch
 from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
+from comfy_kitchen.backends._activations import apply_residual as _apply_residual
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
 from comfy_kitchen.backends._activations import input_act_width as _input_act_width
 from comfy_kitchen.backends.eager import rope as _eager_rope
@@ -619,6 +620,11 @@ def quantize_int8_convrot_weight(
     return q.reshape(weight.shape), scales.reshape(*weight.shape[:-1], 1)
 
 
+# Acts the HIP fused quantizer implements; anything else is applied eagerly so
+# new act codes degrade gracefully instead of erroring in the kernel.
+_HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu")
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -628,10 +634,17 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
+    if input_act not in _HIP_FUSED_ACTS:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
     # k_act is the activated (quantized) row width: swiglu halves the raw row.
     k_act = x.shape[-1] // _input_act_width(input_act)
     if k_act != weight.shape[-1]:
@@ -668,7 +681,7 @@ def int8_linear(
         ):
             return _eager.int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
-                input_act=input_act,
+                input_act=input_act, residual=residual, residual_scale=residual_scale,
             )
         # The only route that absorbs the activation; the rest apply it eagerly.
         q, x_scale = _rotate_quant_int8(x2d, convrot_groupsize, input_act)
@@ -689,7 +702,7 @@ def int8_linear(
         None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
-    return out.reshape(*orig_shape[:-1], n)
+    return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 
 # ---------------------------------------------------------------------------

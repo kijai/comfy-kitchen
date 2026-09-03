@@ -126,6 +126,9 @@ set(CUDA_SOURCES
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
     ops/cutlass_gemm_int8.cu
+    ops/cutlass_gemm_fp16.cu
+    ops/cutlass_conv3d_fp16.cu
+    ops/group_norm_pad3d.cu
     ops/turing_int8.cu
     ops/int8_linear.cu
     ops/convrot_w4a4.cu

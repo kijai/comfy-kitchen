@@ -131,6 +131,33 @@ __device__ __forceinline__ int warp_reduce_sum_i32(int v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_reduce_sum_f32(float v) {
+    for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;
+}
+
+template<int NUM_WARPS>
+__device__ __forceinline__ float block_reduce_sum_f32_t(float v, float* warp_smem, float* block_smem) {
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int wid = threadIdx.x >> 5;
+    v = warp_reduce_sum_f32(v);
+    if (lane == 0) {
+        warp_smem[wid] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        float total = lane < NUM_WARPS ? warp_smem[lane] : 0.0f;
+        total = warp_reduce_sum_f32(total);
+        if (lane == 0) {
+            *block_smem = total;
+        }
+    }
+    __syncthreads();
+    return *block_smem;
+}
+
 template<int NUM_WARPS>
 __device__ __forceinline__ float block_reduce_max_t(float v, float* warp_smem, float* block_smem);
 
@@ -934,6 +961,12 @@ __device__ __forceinline__ float load_input_act(
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
         return (gate / (1.0f + expf(-gate))) * up;
+    } else if constexpr (ACT == kActNanToNum) {
+        // Matches torch.nan_to_num defaults for the input dtype.
+        const float v = to_float(x[in_row + col]);
+        if (isnan(v)) return 0.0f;
+        const float cap = finite_max_for_dtype<InputType>();
+        return fminf(cap, fmaxf(-cap, v));
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
     }
@@ -945,7 +978,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     int8_t* __restrict__ q,
     float* __restrict__ scales,
     int K,
-    uint64_t seed)
+    uint64_t seed,
+    const InputType* __restrict__ act_weight,
+    float act_eps)
 {
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -972,6 +1007,24 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     float* buf1 = buf0 + kConvRotGroup;
     float abs_max = 0.0f;
 
+    // RmsNorm needs the row-wide mean of squares before any value can be
+    // scaled, so it stages the raw row in row_buf (as float) while reducing.
+    // The FHT loop below then reads its 256-wide slice from row_buf and, two
+    // stages later, overwrites that same slice with the rotated values — the
+    // reads and writes of a slice belong to the same 64 threads with
+    // __syncthreads in between, so raw values are never clobbered early.
+    float rstd = 1.0f;
+    if constexpr (ACT == kActRmsNorm) {
+        float sum_sq = 0.0f;
+        for (int col = tid; col < K; col += BLOCK_THREADS) {
+            const float v = to_float(x[row_offset + col]);
+            row_buf[col] = v;
+            sum_sq += v * v;
+        }
+        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, &block_smem);
+        rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
+    }
+
     const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
     for (int it = 0; it < iters; ++it) {
         const int group = it * kGroupsInFlight + sub;
@@ -980,10 +1033,18 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
         const int group_col = group * kConvRotGroup;
         const int col = group_col + base;
 
-        const float x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
-        const float x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
-        const float x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
-        const float x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
+        float x0, x1, x2, x3;
+        if constexpr (ACT == kActRmsNorm) {
+            x0 = active ? row_buf[col] * rstd * to_float(act_weight[col]) : 0.0f;
+            x1 = active ? row_buf[col + 1] * rstd * to_float(act_weight[col + 1]) : 0.0f;
+            x2 = active ? row_buf[col + 2] * rstd * to_float(act_weight[col + 2]) : 0.0f;
+            x3 = active ? row_buf[col + 3] * rstd * to_float(act_weight[col + 3]) : 0.0f;
+        } else {
+            x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
+            x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
+            x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
+            x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
+        }
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
         buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -1303,6 +1364,8 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     bool stochastic,
     int act_code,
     uint64_t seed,
+    const void* act_weight,
+    float act_eps,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -1317,8 +1380,13 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
-    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh && act_code != comfy::kActSwiGLU) {
+    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
+        && act_code != comfy::kActNanToNum) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
+    }
+    if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
+        throw std::runtime_error("convrot64 fused kernel: rms_norm activation requires a weight");
     }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
@@ -1340,7 +1408,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
                 static_cast<int>(num_cols),
-                seed);
+                seed,
+                static_cast<const InputType*>(act_weight),
+                act_eps);
         };
 
         // Same block-size heuristic as before; STOCHASTIC and ACT are turned into
@@ -1378,6 +1448,12 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
                 case comfy::kActSwiGLU:
                     launch_act(std::integral_constant<int, comfy::kActSwiGLU>{}, block_threads);
+                    break;
+                case comfy::kActRmsNorm:
+                    launch_act(std::integral_constant<int, comfy::kActRmsNorm>{}, block_threads);
+                    break;
+                case comfy::kActNanToNum:
+                    launch_act(std::integral_constant<int, comfy::kActNanToNum>{}, block_threads);
                     break;
                 default:
                     launch_act(std::integral_constant<int, comfy::kActNone>{}, block_threads);

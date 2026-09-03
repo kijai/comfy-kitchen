@@ -9,7 +9,11 @@
 namespace comfy {
 
 // SwiGLU is the gated pair: the raw row is [gate | up] (2*K wide) and the
-// activated row silu(gate) * up is K wide; the others are elementwise.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
+// activated row silu(gate) * up is K wide. RmsNorm is the row-wise
+// normalization x * rsqrt(mean(x^2) + eps) * weight and needs the weight
+// pointer and eps carried alongside the code. NanToNum matches
+// torch.nan_to_num defaults (nan -> 0, +/-inf -> dtype finite max/min);
+// the others are elementwise.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActNanToNum = 4 };
 
 }  // namespace comfy
