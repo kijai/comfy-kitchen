@@ -955,6 +955,15 @@ def fp16_linear(
     only when the caller has opted into that mode. Backends without a fused
     kernel fall back to a plain linear.
     """
+    if not _fp16_linear_fills_gpu(x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]):
+        # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
+        # below these sizes, and the dispatch alone would cost more than the call
+        out = torch.nn.functional.linear(x, weight, bias)
+        if residual is None:
+            return out
+        if residual_scale is None:
+            raise ValueError("fp16_linear: residual requires residual_scale")
+        return torch.addcmul(residual.to(out.dtype), out, residual_scale.to(out.dtype))
     kwargs = {
         "x": x,
         "weight": weight,
@@ -964,6 +973,17 @@ def fp16_linear(
     }
     impl = registry.get_implementation("fp16_linear", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def _fp16_linear_fills_gpu(m: int, n: int, k: int) -> bool:
+    """Mirror of the CUDA launcher's tile gate (cutlass_gemm_fp16.cu): the
+    plain-tile configs need ~96 threadblocks to beat cuBLAS's split-K, the
+    stream-K config (K > 4096) ~32. Evaluated here too so small launches skip
+    the dispatch entirely."""
+    if k > 4096:
+        return ((m + 127) // 128) * ((n + 127) // 128) >= 32
+    tile_n = 256 if n <= 3072 or n > 8192 else 128
+    return ((m + 127) // 128) * ((n + tile_n - 1) // tile_n) >= 96
 
 
 def int8_linear(

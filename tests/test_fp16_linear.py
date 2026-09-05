@@ -144,3 +144,32 @@ class TestFp16Linear:
             got = ck.fp16_linear(x, w, b, residual=resid, residual_scale=rscale)
         ref = torch.addcmul(resid, torch.nn.functional.linear(x, w, b), rscale)
         assert ((got.float() - ref.float()).abs().max()).item() < 1e-2
+
+    @pytest.mark.parametrize(
+        "m,n,k,served",
+        [
+            (1797, 6144, 2048, True),   # decoder qkv: 360 plain tiles
+            (1797, 2048, 8192, True),   # decoder w2: stream-K, 120 tiles
+            (1024, 2048, 2048, False),  # 64 plain tiles: cuBLAS split-K is ~2x faster
+            (64, 1024, 4096, False),    # 4 tiles: ~10x slower than cuBLAS
+            (64, 2048, 8192, False),    # stream-K but only 16 tiles
+        ],
+    )
+    def test_small_launches_are_declined(self, m, n, k, served, seed, cuda_available):
+        """The kernel declines launches too small to fill the GPU so the caller
+        runs cuBLAS; the public op stays correct either way."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        x = torch.randn(m, k, dtype=torch.float16, device="cuda")
+        w = torch.randn(n, k, dtype=torch.float16, device="cuda") * 0.02
+        out = torch.empty(m, n, dtype=torch.float16, device="cuda")
+        wrap = cuda_backend._wrap_for_dlpack
+        ok = cuda_backend._C.cutlass_fp16_linear(
+            wrap(x), wrap(w), wrap(cuda_backend._empty_cuda_tensor(x.device, torch.float16)), wrap(out),
+            torch.cuda.current_stream().cuda_stream)
+        assert ok == served
+        got = ck.fp16_linear(x, w, None).float()
+        ref = torch.nn.functional.linear(x, w, None).float()
+        assert rel_err(got, ref) < fp16_accum_tol(k)

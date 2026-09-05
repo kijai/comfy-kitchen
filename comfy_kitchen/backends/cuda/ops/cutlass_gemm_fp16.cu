@@ -134,16 +134,25 @@ using Fp16Configs = ConfigList<
     TileConfig<256, 128, 32, 64, 64, 32, 3>,                                     // 2
     TileConfig<128, 128, 32, 64, 64, 32, 4, 16, ThreadblockSwizzleLeanStreamK>>; // 3 (stream-K)
 
-int select_fp16_config(int n, int k) {
-    if (k > 4096) return 3;
-    if (n <= 3072) return 0;
-    if (n <= 8192) return 1;
-    return 0;
+// Launches with too few threadblocks cannot fill the GPU and lose to cuBLAS's
+// split-K by up to 10x (measured on sm_120: the plain tiles need ~96
+// threadblocks to break even, stream-K, which splits K itself, ~32). Returns
+// -1 for those so the caller hands the shape to cuBLAS.
+constexpr int64_t kMinTilesPlain = 96;
+constexpr int64_t kMinTilesStreamK = 32;
+
+int select_fp16_config(int m, int n, int k) {
+    const int config = k > 4096 ? 3 : (n <= 3072 ? 0 : (n <= 8192 ? 1 : 0));
+    const int tile_n = config == 0 ? 256 : 128;
+    const int64_t tiles = static_cast<int64_t>((m + 127) / 128) * ((n + tile_n - 1) / tile_n);
+    if (tiles < (config == 3 ? kMinTilesStreamK : kMinTilesPlain)) return -1;
+    return config;
 }
 
 template <typename Launch>
-bool launch_fp16_heuristic(int n, int k, Launch launch) {
-    const int selected = select_fp16_config(n, k);
+bool launch_fp16_heuristic(int m, int n, int k, Launch launch) {
+    const int selected = select_fp16_config(m, n, k);
+    if (selected < 0) return false;
     if (launch(selected)) return true;
     for (int config = 0; config < Fp16Configs::size; ++config) {
         if (config != selected && launch(config)) return true;
@@ -179,7 +188,7 @@ bool dispatch_fp16(const half_t* A, const half_t* B, const half_t* bias,
     // bias == nullptr is fine: VisitorRowBroadcast's EnableNullptr fallback
     // broadcasts null_default (0), verified bitwise-identical to a plain store.
     const Fp16Fn* runners = fp16_runners(Fp16Configs{});
-    return launch_fp16_heuristic(N, K, [&](int config) {
+    return launch_fp16_heuristic(M, N, K, [&](int config) {
         return runners[config](A, B, bias, D, M, N, K, stream);
     });
 }
@@ -188,7 +197,7 @@ bool dispatch_fp16_residual(const half_t* A, const half_t* B, const half_t* bias
                             const half_t* rscale, const half_t* resid,
                             half_t* D, int M, int N, int K, cudaStream_t stream) {
     const Fp16ResidualFn* runners = fp16_residual_runners(Fp16Configs{});
-    return launch_fp16_heuristic(N, K, [&](int config) {
+    return launch_fp16_heuristic(M, N, K, [&](int config) {
         return runners[config](A, B, bias, rscale, resid, D, M, N, K, stream);
     });
 }
