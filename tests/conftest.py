@@ -22,6 +22,29 @@ def pytest_sessionfinish(session, exitstatus):
             torch.cuda.synchronize()
 
 
+@pytest.fixture(autouse=True)
+def restore_backend_selection():
+    """Put the registry's priority order and disabled set back after every test.
+
+    Both are process-global, so a test that changes one and does not restore it
+    re-routes every later test in the session. The failure is silent, and worst on
+    ROCm: the default order is ["hip", "cuda", "triton", "eager"], so a list
+    written without "hip" leaves the HIP backend registered but unreachable, and
+    later dispatch assertions get triton or eager instead of failing on the
+    backend that actually changed it.
+    """
+    from comfy_kitchen.registry import registry
+
+    priority = list(registry._priority)
+    disabled = set(registry._disabled)
+    yield
+    registry.set_priority(priority)
+    for name in set(registry._disabled) - disabled:
+        registry.enable(name)
+    for name in disabled - set(registry._disabled):
+        registry.disable(name)
+
+
 def cuda_backend_available() -> bool:
     """Whether the compiled CUDA backend is loadable.
 
@@ -80,7 +103,7 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     capable = []
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "triton", "eager"]:
+    for backend_name in ["cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -102,7 +125,7 @@ def get_supported_devices(func_name: str) -> set[str]:
     devices = set()
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "triton", "eager"]:
+    for backend_name in ["cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 

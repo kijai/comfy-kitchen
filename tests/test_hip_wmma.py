@@ -67,16 +67,24 @@ def hip():
     return hip_backend
 
 
-# Covers each tile path: GEMV (M <= 8), 64x64, 128x128 and 256x128 (K > N), plus
-# sizes that are not multiples of the macro tile.
+# Covers each tile path on 16-48 WGP parts: GEMV (M <= 8), skinny (M or N <= 64),
+# and 64x64/128x128 at both K depths including both deep-K warp grids. K=2064/4112
+# are multiples of 16 but not of BKB=128, to hit its K tail.
 GEMM_SHAPES = [
     (1, 256, 256),
     (8, 512, 256),
     (17, 256, 512),
+    (64, 512, 2064),
     (128, 512, 256),
+    (256, 48, 512),
+    (300, 300, 2064),
     (333, 1152, 1152),
     (512, 256, 1024),
+    (512, 512, 4112),
+    (1024, 512, 4112),
+    (1024, 1024, 4112),
     (1024, 2048, 512),
+    (2048, 2048, 4112),
 ]
 
 
@@ -1121,8 +1129,11 @@ def test_rms_adaln_is_not_adaln(hip):
 
 
 @pytest.mark.parametrize("split_half", [False, True])
-@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rope_matches_eager(split_half, freqs_dtype):
+    """The kernel rotates in fp32 and rounds like eager, which evaluates in the
+    freqs dtype, so a narrow freqs dtype has to come out bit-identical. Loose
+    tolerances hid a folded round_fp16 that left the fp16 path a rounding short."""
     torch.manual_seed(0)
     batch, heads, seq, dim = 2, 8, 128, 64
     xq = torch.randn(batch, heads, seq, dim, device=DEV, dtype=torch.bfloat16)
@@ -1135,8 +1146,14 @@ def test_rope_matches_eager(split_half, freqs_dtype):
     with ck.use_backend("eager"):
         qr, kr = pair(xq, xk, freqs)
 
-    torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    if freqs_dtype is torch.float32:
+        # -ffast-math contracts the split-half add into an fma, one rounding fewer
+        # than eager's separate products; immaterial at fp32 width
+        torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    else:
+        assert torch.equal(q, qr)
+        assert torch.equal(k, kr)
 
 
 # (in-place name, functional sibling, takes a q/k pair, takes a norm weight)
@@ -1729,6 +1746,24 @@ def test_stochastic_rounding_fp8_edge_values_match_eager(dtype):
     assert torch.equal(q.view(torch.uint8)[finite], ref.view(torch.uint8)[finite])
     # eager drops the sign of a NaN here while the kernel keeps it; both are NaN.
     assert torch.isnan(q.float()[~finite]).all()
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("numel", [15, 16, 17, 1 << 20])
+def test_stochastic_rounding_fp8_vector_and_scalar_paths_agree(hip, dtype, numel, out_dtype):
+    """An offset view runs the scalar fallback, which must give the same bits as
+    the vectorized path. The sizes straddle kVecElems to cover the chunk tail, and
+    the two fp8 formats take different constants through the rounding."""
+    torch.manual_seed(numel)
+    x = torch.randn(numel, device=DEV, dtype=dtype) * 10
+    rng = torch.randint(0, 256, (numel,), dtype=torch.uint8, device=DEV)
+
+    aligned = hip.stochastic_rounding_fp8(x.clone(), rng.clone(), out_dtype)
+    offset = hip.stochastic_rounding_fp8(_offset_copy(x), _offset_copy(rng), out_dtype)
+
+    assert x.data_ptr() % 16 == 0 and rng.data_ptr() % 16 == 0
+    assert torch.equal(aligned.view(torch.uint8), offset.view(torch.uint8))
 
 
 # A zero-length dimension makes the grid zero-dimensional, which HIP rejects with

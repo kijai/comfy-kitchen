@@ -28,7 +28,7 @@ def _reference_apply_rope(
 class TestApplyRope:
     """RoPE (Rotary Position Embedding) tests."""
     @pytest.mark.parametrize("op_name", ["apply_rope", "apply_rope1"])
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
     @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
     @pytest.mark.parametrize("config_name,layout,config", [
@@ -93,7 +93,7 @@ class TestApplyRopeSplitHalf:
     """Tests for apply_rope_split_half and apply_rope_split_half1."""
 
     @pytest.mark.parametrize("op_name", ["apply_rope_split_half", "apply_rope_split_half1"])
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
     @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
     @pytest.mark.parametrize("config_name,layout,config", [
@@ -159,7 +159,65 @@ def _max_mismatch(freqs_dtype, dtype):
     return 1e-5
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["triton", "eager"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["NHD", "BNHD"])
+@pytest.mark.parametrize("different_strides", [False, True])
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "apply_rope",
+        "apply_rope1",
+        "apply_rope_",
+        "apply_rope1_",
+        "apply_rope_split_half",
+        "apply_rope_split_half1",
+        "apply_rope_split_half_",
+        "apply_rope_split_half1_",
+    ],
+)
+def test_apply_rope_trellis_layouts(
+    backend, dtype, layout, different_strides, op_name, device, seed
+):
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+
+    prefix = (17,) if layout == "NHD" else (2, 17)
+    qkv = torch.randn(*prefix, 3, 3, 64, device=device, dtype=dtype)
+    q, k, v = qkv.unbind(dim=-3)
+    if different_strides:
+        k = k.contiguous()
+    original_qkv = qkv.clone()
+
+    phases = torch.randn(17, 32, device=device, dtype=torch.float32)
+    cos, sin = phases.cos(), phases.sin()
+    freqs = torch.stack((cos, -sin, sin, cos), dim=-1).reshape(17, 1, 32, 2, 2)
+    if layout == "BNHD":
+        freqs = freqs.unsqueeze(0)
+
+    paired = "1" not in op_name
+    inputs = (q, k) if paired else (q,)
+    references = tuple(
+        _reference_apply_rope(x, freqs, split_half="split_half" in op_name)
+        for x in inputs
+    )
+    pointers = tuple(x.data_ptr() for x in inputs)
+    strides = tuple(x.stride() for x in inputs)
+    with ck.use_backend(backend):
+        result = getattr(ck, op_name)(*inputs, freqs)
+    outputs = result if paired else (result,)
+
+    for actual, expected in zip(outputs, references, strict=True):
+        torch.testing.assert_close(actual, expected)
+    if op_name.endswith("_"):
+        assert tuple(x.data_ptr() for x in outputs) == pointers
+        assert tuple(x.stride() for x in outputs) == strides
+    else:
+        torch.testing.assert_close(qkv, original_qkv, rtol=0, atol=0)
+    torch.testing.assert_close(v, original_qkv.select(-3, 2), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 def test_apply_rope_broadcasts_single_frequency(backend, split_half, device):
     op_name = "apply_rope_split_half1" if split_half else "apply_rope1"
@@ -174,7 +232,7 @@ def test_apply_rope_broadcasts_single_frequency(backend, split_half, device):
     torch.testing.assert_close(actual, reference, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize(
     "q_seq_len,k_seq_len",
     [(3, 3), (3, 5)],
@@ -201,7 +259,7 @@ def test_apply_rope_trims_excess_sequence_frequencies(
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("last_dim_strided", [False, True])
 def test_apply_rope_strided_views(backend, split_half, last_dim_strided, device):
@@ -248,7 +306,7 @@ def test_apply_rope_triton_expanded_input(device):
         "apply_rope_split_half_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton"])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
 def test_apply_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
     if backend not in get_capable_backends(op_name, device):
@@ -293,7 +351,7 @@ def test_apply_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
         "apply_rope_split_half_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton"])
 def test_apply_rope_paired_different_strides(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
@@ -330,7 +388,7 @@ def test_apply_rope_paired_different_strides(op_name, backend, device):
         "apply_rope_split_half1_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 def test_apply_rope_inplace_storage(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
@@ -356,7 +414,7 @@ def test_apply_rope_inplace_storage(op_name, backend, device):
 
 
 @pytest.mark.parametrize("op_name", ["apply_rope1_", "rms_rope1_"])
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 def test_inplace_backends_reject_autograd(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
