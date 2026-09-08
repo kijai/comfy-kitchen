@@ -131,8 +131,7 @@ using comfy_cutlass::ConfigList;
 using Fp16Configs = ConfigList<
     TileConfig<128, 256, 32, 64, 64, 32, 3>,                                     // 0
     TileConfig<128, 128, 32, 64, 64, 32, 4>,                                     // 1
-    TileConfig<256, 128, 32, 64, 64, 32, 3>,                                     // 2
-    TileConfig<128, 128, 32, 64, 64, 32, 4, 16, ThreadblockSwizzleLeanStreamK>>; // 3 (stream-K)
+    TileConfig<128, 128, 32, 64, 64, 32, 4, 16, ThreadblockSwizzleLeanStreamK>>; // 2 (stream-K)
 
 // Launches with too few threadblocks cannot fill the GPU and lose to cuBLAS's
 // split-K by up to 10x (measured on sm_120: the plain tiles need ~96
@@ -142,10 +141,10 @@ constexpr int64_t kMinTilesPlain = 96;
 constexpr int64_t kMinTilesStreamK = 32;
 
 int select_fp16_config(int m, int n, int k) {
-    const int config = k > 4096 ? 3 : (n <= 3072 ? 0 : (n <= 8192 ? 1 : 0));
+    const int config = k > 4096 ? 2 : (n <= 3072 ? 0 : (n <= 8192 ? 1 : 0));
     const int tile_n = config == 0 ? 256 : 128;
     const int64_t tiles = static_cast<int64_t>((m + 127) / 128) * ((n + tile_n - 1) / tile_n);
-    if (tiles < (config == 3 ? kMinTilesStreamK : kMinTilesPlain)) return -1;
+    if (tiles < (config == 2 ? kMinTilesStreamK : kMinTilesPlain)) return -1;
     return config;
 }
 
@@ -203,10 +202,11 @@ bool dispatch_fp16_residual(const half_t* A, const half_t* B, const half_t* bias
 }
 
 // Shape gate shared by both entry points. A zero-K linear is the bias
-// broadcast, and the tile table is tuned for decoder-tile M (~2k); at DiT
-// sequence lengths cuBLAS wins. Both decline so the caller computes them.
+// broadcast, and the tile table is tuned for decoder-tile M (~2k, or a few
+// tiles batched); at DiT sequence lengths cuBLAS wins. Both decline so the
+// caller computes them.
 bool fp16_gemm_shape_ok(int64_t M, int64_t N, int64_t K) {
-    return K != 0 && K % 8 == 0 && N % 8 == 0 && M <= 4096;
+    return K != 0 && K % 8 == 0 && N % 8 == 0 && M <= 8192;
 }
 
 }  // namespace

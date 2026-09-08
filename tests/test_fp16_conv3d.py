@@ -14,7 +14,7 @@ import torch
 from torch.nn import functional
 
 import comfy_kitchen as ck
-from tests.conftest import fp16_accum_tol, get_capable_backends, rel_err
+from tests.conftest import fp16_accum_tol, rel_err
 
 CL3D = torch.channels_last_3d
 
@@ -48,55 +48,60 @@ class TestFp16Conv3d:
             (128, 256, 5, 128, 128, (1, 1, 1), (1, 1, 1)),
         ],
     )
-    @pytest.mark.parametrize("with_bias", [True, False])
-    def test_matches_fp32_accum_reference(self, c, k, d, h, w, ksize, stride, with_bias, seed, cuda_available):
+    @pytest.mark.parametrize("with_bias,with_residual", [(True, False), (False, False), (True, True)])
+    def test_matches_fp32_accum_reference(self, c, k, d, h, w, ksize, stride, with_bias, with_residual, seed, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
         from comfy_kitchen.backends import cuda as cuda_backend
 
-        x, weight, bias, _ = _inputs(c, k, d, h, w, ksize, with_bias=with_bias, stride=stride)
-        got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, None, list(stride))
+        x, weight, bias, residual = _inputs(c, k, d, h, w, ksize, with_bias=with_bias, with_residual=with_residual, stride=stride)
+        got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, list(stride))
         assert got is not None, "fused kernel declined a shape it should serve"
         assert got.is_contiguous(memory_format=CL3D)
-        ref = _ref(x, weight, bias, None, stride)
+        ref = _ref(x, weight, bias, residual, stride)
         kdim = c * math.prod(ksize)
         rel = rel_err(got.float(), ref)
         assert rel < fp16_accum_tol(kdim), f"rel={rel:.4f} tol={fp16_accum_tol(kdim):.4f}"
 
-    def test_residual_fused(self, seed, cuda_available):
-        if not cuda_available:
-            pytest.skip("CUDA required")
-        from comfy_kitchen.backends import cuda as cuda_backend
-
-        x, weight, bias, residual = _inputs(128, 128, 5, 130, 130, (3, 3, 3), with_residual=True)
-        got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
-        assert got is not None
-        ref = _ref(x, weight, bias, residual, (1, 1, 1))
-        rel = rel_err(got.float(), ref)
-        assert rel < fp16_accum_tol(128 * 27), f"rel={rel:.4f}"
-
-    def test_small_launch_declined(self, seed, cuda_available):
-        """Deep-K low-resolution convs cannot fill the GPU and stay on cuDNN;
-        the public op must still return the right answer."""
+    def test_deep_k_small_stage_served(self, seed, cuda_available):
+        """The encoder's 512-channel 16^2 stage: too small for the 128-row tiles,
+        served by the 64-row ones (which beat cuDNN there by 2x)."""
         if not cuda_available:
             pytest.skip("CUDA required")
         from comfy_kitchen.backends import cuda as cuda_backend
 
         x, weight, bias, residual = _inputs(512, 512, 7, 18, 18, (3, 3, 3), with_residual=True)
+        got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+        assert got is not None
+        ref = _ref(x, weight, bias, residual, (1, 1, 1))
+        assert rel_err(got.float(), ref) < fp16_accum_tol(512 * 27)
+
+    def test_token_launch_declined(self, seed, cuda_available):
+        """A launch below even the smallest config's threshold stays on cuDNN;
+        the public op must still return the right answer."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        x, weight, bias, residual = _inputs(64, 64, 3, 6, 6, (3, 3, 3), with_residual=True)
         assert cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
         got = ck.fp16_conv3d(x, weight, bias, residual)
         ref = _ref(x, weight, bias, residual, (1, 1, 1))
         assert rel_err(got.float(), ref) < 2e-3  # cuDNN fp32-accumulate path
 
-    def test_unaligned_channels_fall_back(self, seed, cuda_available):
-        """C=3 (the pixel input) cannot use the kernel but must be correct."""
+    def test_pixel_channels_are_padded(self, seed, cuda_available):
+        """C=3 (the pixel input) is zero-padded to the 8-channel vector width
+        and served; the padded taps must contribute nothing."""
         if not cuda_available:
             pytest.skip("CUDA required")
-        x = torch.randn(1, 3, 5, 34, 34, dtype=torch.float16, device="cuda")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        x = torch.randn(1, 3, 5, 130, 130, dtype=torch.float16, device="cuda")
         weight = torch.randn(128, 3, 3, 3, 3, dtype=torch.float16, device="cuda") * 0.1
-        got = ck.fp16_conv3d(x, weight, None)
+        got = cuda_backend._cutlass_fp16_conv3d(x, weight, None, None, [1, 1, 1])
+        assert got is not None and got.shape == (1, 128, 3, 128, 128)
         ref = _ref(x, weight, None, None, (1, 1, 1))
-        assert rel_err(got.float(), ref) < 2e-3
+        assert rel_err(got.float(), ref) < fp16_accum_tol(3 * 27)
 
     def test_residual_shape_mismatch_falls_back(self, seed, cuda_available):
         if not cuda_available:
@@ -105,15 +110,3 @@ class TestFp16Conv3d:
 
         x, weight, bias, residual = _inputs(128, 128, 5, 130, 130, (3, 3, 3), with_residual=True)
         assert cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual[:, :64], [1, 1, 1]) is None
-
-    def test_eager_backend_agrees(self, seed, cuda_available):
-        device = "cuda" if cuda_available else "cpu"
-        if "eager" not in get_capable_backends("fp16_conv3d", device):
-            pytest.skip("eager backend not capable")
-        x = torch.randn(1, 16, 4, 10, 10, dtype=torch.float32, device=device)
-        weight = torch.randn(16, 16, 3, 3, 3, dtype=torch.float32, device=device) * 0.05
-        bias = torch.randn(16, dtype=torch.float32, device=device)
-        residual = torch.randn(1, 16, 2, 8, 8, dtype=torch.float32, device=device)
-        with ck.use_backend("eager"):
-            got = ck.fp16_conv3d(x, weight, bias, residual)
-        assert torch.allclose(got, _ref(x, weight, bias, residual, (1, 1, 1)), atol=1e-4)

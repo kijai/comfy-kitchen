@@ -294,7 +294,7 @@ extern "C" {
     bool launch_cutlass_fp16_conv3d(
         const void* x, const void* w, const void* bias, const void* resid, bool resid_full, void* out,
         int N, int D, int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q,
-        int sd, int sh, int sw, cudaStream_t stream);
+        int sd, int sh, int sw, int config, cudaStream_t stream);
 
     // Per-frame GroupNorm + SiLU + causal conv padding in NDHWC — see ops/group_norm_pad3d.cu.
     void launch_group_norm_silu_pad3d(
@@ -1517,33 +1517,6 @@ static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batc
     const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, (int)token_aug, v, 48);
     if (n > 48 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
         throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
-    // The plan's slots are byte offsets and the Python layer slices the workspace
-    // with them; anything but a byte array reads the wrong slots.
-    if (ws.dtype().code != (uint8_t)nb::dlpack::dtype_code::UInt || ws.dtype().bits != 8)
-        throw std::runtime_error(std::string(who) + ": workspace must be a uint8 array");
-}
-// Extents size every workspace slot and every grid; a non-positive one plans a
-// workspace nothing checks again. Reject each on its own, before any product.
-static void need_positive_extents(int64_t batch, int64_t seq_len, int64_t num_heads, const char* who) {
-    if (batch <= 0 || seq_len <= 0 || num_heads <= 0)
-        throw std::runtime_error(std::string(who) + ": batch, head counts and sequence lengths must be positive");
-}
-// Both sinks are half-open [start, end) block ranges. A negative start would
-// make the routing kernel emit that many extra list entries, wrapped to huge
-// uint16 block ids, and overrun the per-query row.
-static void need_sinks(int64_t start, int64_t end, const char* who, const char* what) {
-    if (start < 0 || end < 0 || end < start)
-        throw std::runtime_error(std::string(who) + ": " + what
-                                 + " must be a [start, end) range with 0 <= start <= end");
-}
-static void need_contiguous(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what);
-// A float32 vector the kernels read with the element count as the byte bound:
-// a narrower dtype is shorter than what is read, a strided view is read packed.
-static void need_f32_vector(const nb::ndarray<nb::device::cuda>& a, int64_t n, const char* who, const char* what) {
-    need_elems(a, n, who, what);
-    if (a.dtype().code != (uint8_t)nb::dlpack::dtype_code::Float || a.dtype().bits != 32)
-        throw std::runtime_error(std::string(who) + ": " + what + " must be float32");
-    need_contiguous(a, who, what);
 }
 // q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
 static int sol_elem_code(const nb::ndarray<nb::device::cuda>& a) {
@@ -1604,10 +1577,8 @@ void sol_attn(
     bool tail = true, int64_t token_aug = 0)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    need_positive_extents(batch, seq_len, num_heads, "sol_attn");
-    need_sinks(sink_start, sink_end, "sol_attn", "sink_blocks");
-    need_sinks(sink_q_start, sink_q_end, "sol_attn", "sink_q");
-    if (threshold) need_f32_vector(*threshold, batch * num_heads * ((seq_len + 63) / 64), "sol_attn", "threshold");
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");
@@ -1620,7 +1591,7 @@ void sol_attn(
     need_staging_layout(v, "sol_attn", "v");
     need_contiguous(out, "sol_attn", "out");
     need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn");
-    if (key_bias) need_f32_vector(*key_bias, batch * seq_len, "sol_attn", "key_bias");
+    if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
@@ -1638,8 +1609,6 @@ void sol_attn(
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
                            int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, int64_t token_aug = 0) {
-    need_positive_extents(batch, seq_len, num_heads, "sol_producer_begin");
-    need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
     sol_producer_begin(workspace.data(), (int)batch, (int)seq_len,
                        (int)num_heads, (int)token_aug, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -1653,7 +1622,6 @@ void sol_producer_chunk_py(
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
-    need_positive_extents(batch, seq_len, num_heads, "sol_producer_chunk");
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1687,20 +1655,15 @@ void sol_attn_core_py(
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
     bool tail = true, int64_t token_aug = 0) {
-    need_positive_extents(batch, seq_len, num_heads, "sol_attn_core");
-    need_sinks(sink_start, sink_end, "sol_attn_core", "sink_blocks");
-    need_sinks(sink_q_start, sink_q_end, "sol_attn_core", "sink_q");
     const int64_t stats = batch * num_heads * 128;
-    need_f32_vector(vscale, stats, "sol_attn_core", "vscale");
-    need_f32_vector(kmean_next, stats, "sol_attn_core", "kmean_next");
-    need_f32_vector(vamax_out, stats, "sol_attn_core", "vamax_out");
-    if (threshold) need_f32_vector(*threshold, batch * num_heads * ((seq_len + 63) / 64), "sol_attn_core", "threshold");
+    if ((int64_t)vscale.size() != stats || (int64_t)kmean_next.size() != stats ||
+        (int64_t)vamax_out.size() != stats)
+        throw std::runtime_error("sol_attn_core: vscale/kmean_next/vamax_out must have B*H*128 elements");
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn_core");
     need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn_core");
     need_elems(out, batch * seq_len * num_heads * 128, "sol_attn_core", "out");
-    if (out.dtype().bits != 16)  // the kernel writes 16-bit elements; a narrower out is half the bytes
-        throw std::runtime_error("sol_attn_core: out must be a bfloat16 or float16 array");
-    need_contiguous(out, "sol_attn_core", "out");
     launch_sol_attn_core(
         workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
         block_len ? block_len->data() : nullptr, tail ? 1 : 0,
@@ -1763,7 +1726,7 @@ bool cutlass_fp16_conv3d(
     int64_t N, int64_t D, int64_t H, int64_t W, int64_t C,
     int64_t K, int64_t T, int64_t R, int64_t S,
     int64_t sd, int64_t sh, int64_t sw,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr, int64_t config = -1)
 {
     const int64_t Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
     if (D < T || H < R || W < S) {
@@ -1784,7 +1747,7 @@ bool cutlass_fp16_conv3d(
         static_cast<int>(N), static_cast<int>(D), static_cast<int>(H), static_cast<int>(W), static_cast<int>(C),
         static_cast<int>(K), static_cast<int>(T), static_cast<int>(R), static_cast<int>(S),
         static_cast<int>(Z), static_cast<int>(P), static_cast<int>(Q),
-        static_cast<int>(sd), static_cast<int>(sh), static_cast<int>(sw), stream);
+        static_cast<int>(sd), static_cast<int>(sh), static_cast<int>(sw), static_cast<int>(config), stream);
 }
 
 // Nanobind wrapper for the fused per-frame GroupNorm + SiLU + causal padding.
@@ -3963,8 +3926,8 @@ NB_MODULE(_C, m) {
     m.def("quantize_int8_rowwise_convrot64", &quantize_int8_rowwise_convrot64,
           "Fused ConvRot rowwise INT8 quantization using 64-lane FHT groups. "
           "act_code applies an activation to the input first (the comfy::kAct* "
-          "codes in input_act_codes.h: none, gelu tanh-approx, swiglu, rms_norm, "
-          "nan_to_num), folding it into the quantizer instead of round-tripping "
+          "codes in input_act_codes.h: none, gelu tanh-approx, swiglu, "
+          "rms_norm), folding it into the quantizer instead of round-tripping "
           "it through HBM. rms_norm "
           "reads its K-element weight from act_weight (same dtype as the "
           "input; pass an empty tensor otherwise) and eps from act_eps.",
@@ -4271,7 +4234,7 @@ NB_MODULE(_C, m) {
           nb::arg("x"), nb::arg("w"), nb::arg("bias"), nb::arg("residual"), nb::arg("out"),
           nb::arg("N"), nb::arg("D"), nb::arg("H"), nb::arg("W"), nb::arg("C"),
           nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
-          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"));
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("config") = -1);
 
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d,
           "Per-frame GroupNorm + SiLU + causal conv padding, NDHWC",

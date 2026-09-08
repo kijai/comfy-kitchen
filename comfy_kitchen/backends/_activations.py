@@ -25,7 +25,6 @@ INPUT_ACT_TO_CODE: dict[str | None, int] = {
     "gelu_tanh": 1,
     "swiglu": 2,
     "rms_norm": 3,
-    "nan_to_num": 4,
 }
 
 
@@ -65,8 +64,6 @@ def apply_input_act(
             raise ValueError("input_act 'rms_norm' requires act_weight")
         return torch.nn.functional.rms_norm(
             x, (x.shape[-1],), weight=act_weight.to(x.dtype), eps=act_eps)
-    if input_act == "nan_to_num":
-        return torch.nan_to_num(x)
     raise ValueError(_unsupported(input_act))
 
 

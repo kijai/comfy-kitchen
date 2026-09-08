@@ -541,46 +541,30 @@ def _wrap_for_dlpack(tensor: torch.Tensor):
     return tensor.__dlpack__(stream=-1)
 
 
-def _fp8_vec16_safe(x: torch.Tensor) -> torch.Tensor:
-    """A view of `x` the vectorized per-tensor fp8 kernels can run on.
-
-    The kernels move 16 values per thread with float4 loads/stores, so they
-    need a 16-byte-aligned base and a multiple-of-16 element count; anything
-    else (a sliced view, a ragged tail) is repacked into a padded buffer so
-    the same kernel runs bit-identically. The caller slices back to numel.
-    """
-    numel = x.numel()
-    if x.is_contiguous() and x.data_ptr() % 16 == 0 and numel % 16 == 0:
-        return x.reshape(-1)  # a view
-    padded = torch.empty(((numel + 15) // 16) * 16, dtype=x.dtype, device=x.device)
-    padded[:numel].view(x.shape).copy_(x)  # one strided copy, no intermediate
-    padded[numel:].zero_()
-    return padded
-
-
 def quantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.float8_e4m3fn
 ) -> torch.Tensor:
     input_dtype_code = DTYPE_TO_CODE[x.dtype]
     output_dtype_code = DTYPE_TO_CODE[output_type]
 
-    orig_shape = x.shape
-    numel = x.numel()
-    x_vec = _fp8_vec16_safe(x)
-    result_uint8 = torch.empty(x_vec.shape, dtype=torch.uint8, device=x.device)
+    if not x.is_contiguous():
+        x = x.contiguous()
 
+    result_uint8 = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
+
+    numel = x.numel()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.quantize_per_tensor_fp8(
-        _wrap_for_dlpack(x_vec),
+        _wrap_for_dlpack(x),
         _wrap_for_dlpack(scale),
         _wrap_for_dlpack(result_uint8),
         input_dtype_code,
         output_dtype_code,
-        x_vec.numel(),
+        numel,
         stream_ptr,
     )
 
-    return result_uint8[:numel].reshape(orig_shape).view(output_type)
+    return result_uint8.view(output_type)
 
 
 def dequantize_per_tensor_fp8(
@@ -591,23 +575,21 @@ def dequantize_per_tensor_fp8(
     input_dtype_code = DTYPE_TO_CODE[x.dtype]
     output_dtype_code = DTYPE_TO_CODE[output_type]
 
-    orig_shape = x.shape
+    result = torch.empty(x.shape, dtype=output_type, device=x.device)
     numel = x.numel()
-    x_vec = _fp8_vec16_safe(x.view(torch.uint8))
-    result = torch.empty(x_vec.shape, dtype=output_type, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.dequantize_per_tensor_fp8(
-        _wrap_for_dlpack(x_vec),
+        _wrap_for_dlpack(x.view(torch.uint8)),
         _wrap_for_dlpack(scale),
         _wrap_for_dlpack(result),
         input_dtype_code,
         output_dtype_code,
-        x_vec.numel(),
+        numel,
         stream_ptr,
     )
 
-    return result[:numel].reshape(orig_shape)
+    return result
 
 
 def stochastic_rounding_fp8(
@@ -2895,8 +2877,9 @@ def _zero_vector(n: int, device: torch.device, dtype: torch.dtype = torch.float1
     return vec
 
 
-def _cutlass_fp16_conv3d(x, weight, bias, residual, stride):
-    """The fused kernel, or None when it does not apply to this call."""
+def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
+    """The fused kernel, or None when it does not apply to this call.
+    config forces a tile config (benchmarking); -1 selects by shape."""
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -2904,12 +2887,17 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride):
     supported = (
         x.dtype == torch.float16 and weight.dtype == torch.float16
         and x.is_cuda and weight.device == x.device and weight.shape[1] == c
-        and c % 8 == 0 and k % 8 == 0 and d >= t and h >= r and w >= s
+        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
         and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
         and (residual is None or (residual.dtype == torch.float16 and residual.shape == (n, k, z, p, q)))
     )
     if not supported:
         return None
+    if c < 8:
+        # zero-pad pixel-sized channel counts (conv_in) to the kernel's 8-channel vector width
+        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        c = 8
     x = x.contiguous(memory_format=torch.channels_last_3d)
     weight = weight.contiguous(memory_format=torch.channels_last_3d)
     bias = bias.contiguous() if bias is not None else _zero_vector(k, x.device)
@@ -2922,7 +2910,7 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride):
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
         _wrap_for_dlpack(residual), _wrap_for_dlpack(out),
         n, d, h, w, c, k, t, r, s, sd, sh, sw,
-        torch.cuda.current_stream(x.device).cuda_stream,
+        torch.cuda.current_stream(x.device).cuda_stream, config,
     )
     return out if ok else None
 

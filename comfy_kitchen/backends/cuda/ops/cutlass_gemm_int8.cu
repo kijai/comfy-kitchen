@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cmath>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -205,9 +206,34 @@ int select_fused_int8_config(int m, int n, int k) {
     return mn <= 108003328 ? 0 : 13;
 }
 
+// The tree ignores wave quantization: at decoder-tile M (~2k rows) its 128x256
+// pick can leave a 2.1-wave grid where 128x128 wins despite ~8% lower per-tile
+// throughput. Between those two, take the smaller wave-rounding x tile-cost.
+int device_sm_count() {
+    static int counts[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return 1;
+    if (counts[dev] == 0) {
+        cudaDeviceGetAttribute(&counts[dev], cudaDevAttrMultiProcessorCount, dev);
+        if (counts[dev] <= 0) counts[dev] = 1;
+    }
+    return counts[dev];
+}
+
+int wave_guard(int m, int n, int selected) {
+    if (selected != 0 && selected != 1) return selected;
+    const int sms = device_sm_count();
+    auto cost = [&](int64_t tile_n, double per_tile) {
+        const double waves = double(((m + 127) / 128) * ((n + tile_n - 1) / tile_n)) / sms;
+        return std::ceil(waves) / waves * per_tile;
+    };
+    return cost(256, 1.0) <= cost(128, 1.08) ? 0 : 1;
+}
+
 template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
-    const int selected = select_fused_int8_config(m, n, k);
+    const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (launch(selected)) return true;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};

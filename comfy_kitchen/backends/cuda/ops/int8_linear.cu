@@ -961,12 +961,6 @@ __device__ __forceinline__ float load_input_act(
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
         return (gate / (1.0f + expf(-gate))) * up;
-    } else if constexpr (ACT == kActNanToNum) {
-        // Matches torch.nan_to_num defaults for the input dtype.
-        const float v = to_float(x[in_row + col]);
-        if (isnan(v)) return 0.0f;
-        const float cap = finite_max_for_dtype<InputType>();
-        return fminf(cap, fmaxf(-cap, v));
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
     }
@@ -1381,8 +1375,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
-        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
-        && act_code != comfy::kActNanToNum) {
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
     }
     if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
@@ -1413,12 +1406,13 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 act_eps);
         };
 
-        // Same block-size heuristic as before; STOCHASTIC and ACT are turned into
-        // compile-time constants so neither costs a branch in the inner loop.
+        // one block per row: smaller blocks keep more rows in flight, wide
+        // blocks only pay off for deep rows (measured on sm_120)
         const int block_threads = (num_rows == 1) ? 512
                                 : (num_cols == comfy::kConvRotGroup) ? 64
-                                : (num_cols == 2560) ? 640
-                                : (num_cols == 6144) ? 768
+                                : (num_cols <= 3072) ? 128
+                                : (num_cols <= 6144) ? 256
+                                : (num_cols < 12288) ? 512
                                 : 1024;
 
         DISPATCH_BOOL(stochastic, kStoch, [&] {
@@ -1428,14 +1422,14 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     case 64:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 64, kStoch, kAct>, 64);
                         break;
+                    case 128:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 128, kStoch, kAct>, 128);
+                        break;
+                    case 256:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 256, kStoch, kAct>, 256);
+                        break;
                     case 512:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, kStoch, kAct>, 512);
-                        break;
-                    case 640:
-                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 640, kStoch, kAct>, 640);
-                        break;
-                    case 768:
-                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 768, kStoch, kAct>, 768);
                         break;
                     default:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, kStoch, kAct>, 1024);
@@ -1451,9 +1445,6 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch_act(std::integral_constant<int, comfy::kActRmsNorm>{}, block_threads);
-                    break;
-                case comfy::kActNanToNum:
-                    launch_act(std::integral_constant<int, comfy::kActNanToNum>{}, block_threads);
                     break;
                 default:
                     launch_act(std::integral_constant<int, comfy::kActNone>{}, block_threads);
