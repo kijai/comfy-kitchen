@@ -1904,7 +1904,7 @@ def fp16_linear(
 
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
-    m, k = x_2d.shape
+    m = x_2d.shape[0]
     n = weight.shape[0]
 
     supported = (
