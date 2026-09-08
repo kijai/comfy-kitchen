@@ -9,9 +9,7 @@
 namespace comfy {
 
 // SwiGLU is the gated pair: the raw row is [gate | up] (2*K wide) and the
-// activated row silu(gate) * up is K wide. RmsNorm is the row-wise
-// normalization x * rsqrt(mean(x^2) + eps) * weight and needs the weight
-// pointer and eps carried alongside the code. The others are elementwise.
+// activated row silu(gate) * up is K wide. RmsNorm carries a weight pointer and eps.
 enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3 };
 
 }  // namespace comfy

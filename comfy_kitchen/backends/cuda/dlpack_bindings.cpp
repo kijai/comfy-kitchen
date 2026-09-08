@@ -1713,10 +1713,8 @@ void rms_adaln(
         N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
 }
 
-// Nanobind wrapper for the fp16-accumulate conv3d. All tensors fp16 NDHWC
-// (validated on the Python side); residual is either the full output shape or
-// a K-vector (zeros when there is no residual). Returns false when the shape
-// is declined so the caller can fall back.
+// fp16-accumulate conv3d; all tensors fp16 NDHWC (validated in Python), residual is
+// the full output or a K-vector of zeros. Returns false when the shape is declined.
 bool cutlass_fp16_conv3d(
     nb::ndarray<nb::device::cuda> x,
     nb::ndarray<nb::device::cuda> w,
@@ -2631,10 +2629,8 @@ void int4_weight_int8_act_gemm_dequant_chunked(
         stream);
 }
 
-// Shared operand checks for the int8 fused-dequant GEMM bindings: A [M,K] int8,
-// B [N,K] int8, D [M,N] in out_dtype_code, xs [M] / ws [N] fp32, bias empty or
-// a length-N vector in the OUTPUT dtype (the kernels read it as such).
-// Returns (M, N, K).
+// Operand checks for the int8 fused-dequant GEMM bindings: A [M,K], B [N,K] int8,
+// D [M,N] in out_dtype_code, xs [M] / ws [N] fp32, bias empty or [N] in the output dtype.
 static std::tuple<int64_t, int64_t, int64_t> check_int8_gemm_operands(
     const char* name,
     const nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda>& a,
@@ -2649,10 +2645,8 @@ static std::tuple<int64_t, int64_t, int64_t> check_int8_gemm_operands(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K) throw std::runtime_error(std::string(name) + ": K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error(std::string(name) + ": D shape mismatch");
-    // xs/ws/bias are read as contiguous [M]/[N] vectors; check element counts (via size(),
-    // which tolerates the [M,1] scale the int8 caller passes but rejects degenerate shapes
-    // like [M,0]). Match the output dtype exactly (fp16 and bf16 share itemsize but the
-    // launch selects half_t vs bfloat16_t) so a mismatched code can't reinterpret the buffer.
+    // size() tolerates the [M,1] scale the int8 caller passes; the output dtype must match
+    // the code exactly (fp16 and bf16 share an itemsize but select different kernels).
     if (static_cast<int64_t>(xs.size()) != M) throw std::runtime_error(std::string(name) + ": xs must be a length-M vector");
     if (static_cast<int64_t>(ws.size()) != N) throw std::runtime_error(std::string(name) + ": ws must be a length-N vector");
     if (bias.size() != 0 && (static_cast<int64_t>(bias.size()) != N

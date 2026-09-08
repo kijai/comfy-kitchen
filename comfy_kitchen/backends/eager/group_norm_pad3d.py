@@ -17,9 +17,8 @@ def group_norm_silu_pad3d(
     pad: list[int],
     silu: bool,
 ) -> Tensor:
-    """Per-frame GroupNorm (statistics over one frame's C, H, W), optional SiLU,
-    then the causal 3D conv padding: reflect (left, right, top, bottom) in
-    space and `front` zero frames in time. weight=None skips the norm."""
+    """Per-frame GroupNorm, optional SiLU, then reflect (l, r, t, b) and `front`
+    zero frames of padding. weight=None skips the norm."""
     orig = x
     b, c, t, h, w = x.shape
     if weight is not None:

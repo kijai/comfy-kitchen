@@ -313,15 +313,10 @@ def fp16_conv3d(
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
 ) -> torch.Tensor:
-    """fp16-accumulate 3D convolution with bias and residual fused into the epilogue.
+    """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
-    x is [N, C, D, H, W], weight [K, C, T, R, S], zero padding only (pre-pad
-    with group_norm_silu_pad3d, whose channels_last_3d output this consumes
-    directly). Same opt-in numerics as fp16_linear: accumulation in fp16, so
-    callers should gate on the user having chosen fp16 accumulation. The
-    residual, if given, must match the output shape. Shapes the fused kernel
-    declines (channels not a multiple of 8, launches too small to fill the
-    GPU) run torch's conv, i.e. cuDNN with fp32 accumulation.
+    x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
+    numerics as fp16_linear; shapes the kernel declines run torch's conv.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
     return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
@@ -336,14 +331,10 @@ def group_norm_silu_pad3d(
     pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
     silu: bool = True,
 ) -> torch.Tensor:
-    """Per-frame GroupNorm, SiLU and causal 3D-conv padding in one pass.
+    """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
-    x is [B, C, T, H, W]; statistics are taken per frame over (C/num_groups, H, W)
-    as in a GroupNorm applied to each frame separately. pad is
-    (left, right, top, bottom, front): reflect padding in space and zero
-    frames prepended in time, giving [B, C, T+front, H+top+bottom, W+left+right].
-    weight=None skips the norm (pad-only). The CUDA backend returns the result
-    in channels_last_3d, which cuDNN consumes without layout conversions.
+    x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
+    zero frames in front. weight=None is pad-only. CUDA returns channels_last_3d.
     """
     return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
 
@@ -947,15 +938,10 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP16 linear with fp16 accumulators and an optional fused residual.
+    """fp16-accumulate linear, optionally with ``residual + residual_scale * out`` fused.
 
-    ``x @ weight.T + bias``, or ``residual + residual_scale * (x @ weight.T
-    + bias)`` (a pre-norm block's addcmul) fused into the GEMM epilogue.
-
-    Accumulates in fp16 -- the same numerics as
-    ``torch.backends.cuda.matmul.allow_fp16_accumulation`` -- so route here
-    only when the caller has opted into that mode. Backends without a fused
-    kernel fall back to a plain linear.
+    Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
+    route here only when the user opted into that mode.
     """
     if not _fp16_linear_fills_gpu(x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
@@ -978,10 +964,8 @@ def fp16_linear(
 
 
 def _fp16_linear_fills_gpu(m: int, n: int, k: int) -> bool:
-    """Mirror of the CUDA launcher's tile gate (cutlass_gemm_fp16.cu): the
-    plain-tile configs need ~96 threadblocks to beat cuBLAS's split-K, the
-    stream-K config (K > 4096) ~32. Evaluated here too so small launches skip
-    the dispatch entirely."""
+    """Mirror of the launcher's tile gate (cutlass_gemm_fp16.cu), so small
+    launches skip the dispatch entirely."""
     if k > 4096:
         return ((m + 127) // 128) * ((n + 127) // 128) >= 32
     tile_n = 256 if n <= 3072 or n > 8192 else 128

@@ -2,9 +2,8 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Pieces shared by the CUTLASS GEMM translation units (int8 dequant, fp16):
- * the per-stream workspace cache, the lean stream-K threadblock swizzle, and
- * the GemmUniversal launch tail.
+  * Shared by the CUTLASS GEMM units (int8, fp16): per-stream workspace cache,
+  * lean stream-K swizzle, GemmUniversal launch tail.
  */
 #pragma once
 
@@ -206,9 +205,8 @@ struct IsStreamKSwizzle : std::false_type {};
 template <typename T>
 struct IsStreamKSwizzle<T, std::void_t<typename T::StreamkFeature>> : std::true_type {};
 
-// A tile configuration for the EVT GEMM kernels. Each kernel file keeps ONE
-// list of these and instantiates every epilogue variant (plain, residual, ...)
-// from it, so the shape heuristic's indices mean the same tile in every table.
+// A tile configuration; each kernel file instantiates every epilogue variant
+// from one list of these, so heuristic indices mean the same tile in every table.
 template <int TBM_, int TBN_, int TBK_, int WM_, int WN_, int WK_, int NumStages_,
           int AlignmentAB_ = 16,
           typename ThreadblockSwizzle_ = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
@@ -225,10 +223,8 @@ struct ConfigList {
     static constexpr int size = sizeof...(Configs);
 };
 
-// Common GemmUniversal launch tail for the EVT kernels: builds arguments for
-// row-major A [M,K] x column-major B (given [N,K] row-major), runs
-// can_implement / workspace / initialize, and launches. The stream-K swizzle
-// takes one extra trailing argument.
+// GemmUniversal launch tail: A [M,K] row-major x B [N,K] (column-major view),
+// can_implement / workspace / initialize / run. Stream-K takes one extra argument.
 template <typename Gemm, typename Callback, typename ElementA, typename ElementB>
 bool launch_universal(const ElementA* A, const ElementB* B, const Callback& cb,
                       int M, int N, int K, cudaStream_t stream) {

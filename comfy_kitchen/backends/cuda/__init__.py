@@ -500,10 +500,8 @@ def _aligned16(t: torch.Tensor) -> bool:
 
 
 def _gemm_vector_arg(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """A per-channel vector (bias, residual scale) as the CUTLASS epilogues
-    read it: on `device`, in `dtype`, contiguous and 16-byte aligned. The
-    row-broadcast visitors issue 16-byte vector loads, so a sub-view at an odd
-    offset must be copied rather than passed by pointer."""
+    """A per-channel vector as the CUTLASS epilogues read it: on device, in dtype,
+    contiguous and 16-byte aligned (the row-broadcast visitors load 16-byte vectors)."""
     if v.device == device and v.dtype == dtype and v.is_contiguous() and _aligned16(v):
         return v
     v = v.to(device=device, dtype=dtype).contiguous()
@@ -1898,9 +1896,7 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Shape-tuned CUTLASS fp16-accumulate GEMM with fused bias/residual.
-
-    Falls back to cuBLAS (torch's current accumulate mode) when the fused
+    """CUTLASS fp16-accumulate GEMM with fused bias/residual; cuBLAS when the
     kernel cannot serve the shape.
     """
     if residual is not None and residual_scale is None:
@@ -2923,9 +2919,8 @@ def fp16_conv3d(
     residual: torch.Tensor | None,
     stride: list[int],
 ) -> torch.Tensor:
-    """fp16-accumulate 3D conv (zero padding) with bias and residual fused into
-    the epilogue; channels_last_3d in and out. Falls back to torch's conv when
-    the fused kernel declines the shape."""
+    """fp16-accumulate conv3d with fused bias/residual, channels_last_3d in and out;
+    torch's conv when the kernel declines the shape."""
     out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride)
     if out is not None:
         return out

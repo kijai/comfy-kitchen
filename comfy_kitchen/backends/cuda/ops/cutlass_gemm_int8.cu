@@ -114,12 +114,8 @@ struct FusedInt8Gemm {
     }
 };
 
-// FusedInt8Gemm plus a fused residual epilogue:
-//   D = residual + rscale * (acc * xs * ws + bias)
-// i.e. a pre-norm block's `x.addcmul_(branch(x), scale)` without writing the
-// branch output to HBM just to read it straight back. rscale is a per-channel
-// (length-N) vector and the residual a full [M, N] tensor, both in the output
-// dtype.
+// FusedInt8Gemm with the pre-norm block's addcmul in the epilogue:
+//   D = residual + rscale[n] * (acc * xs * ws + bias); rscale and residual in the output dtype.
 template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
           typename ArchTag = cutlass::arch::Sm80,
           bool ScalarWeightScale = false, int AlignmentAB = 16,
@@ -149,9 +145,7 @@ struct FusedInt8GemmResidual {
     using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
     using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, WScale>;
-    // The bias add rounds to ElementOutput exactly like the plain FusedInt8Gemm,
-    // so the fused-residual value differs from the eager chain only where the
-    // eager addcmul's fp16 multiply/add would have rounded.
+    // bias add rounds to ElementOutput like the plain kernel; only the addcmul stays fp32
     using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Bias>;
     using Mul3 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
@@ -250,10 +244,8 @@ bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
     return false;
 }
 
-// The tile table, spanning big-GPU/large-M (wide) to small-GPU/small-M (more
-// CTAs). select_fused_int8_config and the fallback orders above index THIS
-// list; every epilogue variant's runner table is instantiated from it below,
-// so the residual path always launches the tile the heuristic chose.
+// The tile table; select_fused_int8_config and the fallback orders index it, and
+// every epilogue variant's runner table is instantiated from it.
 using comfy_cutlass::TileConfig;
 using comfy_cutlass::ConfigList;
 using FusedInt8Configs = ConfigList<
@@ -282,9 +274,8 @@ using ResidualGemm = FusedInt8GemmResidual<OutT, C::TBM, C::TBN, C::TBK, C::WM, 
                                            C::NumStages, cutlass::arch::Sm80, false,
                                            C::AlignmentAB, typename C::ThreadblockSwizzle>;
 
-// One run_strided table (stride == N is the plain case) serves the heuristic
-// dispatch, the strided variant, and the benchmark-by-config entry. bias may
-// be nullptr: the RowBroadcast visitor broadcasts null_default (0).
+// One run_strided table (stride == N is the plain case) serves every entry
+// point; bias may be nullptr (the RowBroadcast visitor broadcasts 0).
 template <typename OutT>
 using FusedFn = bool (*)(const int8_t*, const int8_t*, const float*, const float*,
                          const OutT*, OutT*, int, int, int, int, cudaStream_t);

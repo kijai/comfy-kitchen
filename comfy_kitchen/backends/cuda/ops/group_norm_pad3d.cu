@@ -1,38 +1,14 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
-// group_norm_silu_pad3d: per-frame GroupNorm, SiLU and the causal-conv padding
-// of a 3D CNN (reflect in space, zero frames in front) in one pass, in NDHWC.
-//
-// The eager sequence is permute+contiguous, GroupNorm statistics, normalize,
-// SiLU, reflect pad and constant pad: seven memory passes plus the NCDHW<->NDHWC
-// conversions cuDNN inserts around every conv. Here x is read twice (once for
-// statistics, once to normalize) and the padded output is written once, in
-// the NDHWC layout cuDNN runs natively.
-//
-//   stats_partial:  per (frame, row chunk, channel) sum / sum of squares
-//   stats_finalize: reduce chunks and channels per group -> mean, rstd
-//   apply:          y = silu((x - mean) * rstd * gamma + beta) written into
-//                   the padded output, reflected spatial indices computed on
-//                   the store side; the leading `front` frames are zero.
-//
-// x is [frames, rows, C] with rows = H*W; channels innermost. C must be a
-// multiple of 8 (16-byte vectors) and C/8 must divide the block size.
-// Statistics are sum / sum-of-squares in fp32 over 1024-row chunks, reduced in
-// double; torch uses Welford, so the two agree to fp32 rounding, not bitwise.
+// group_norm_silu_pad3d: per-frame GroupNorm + SiLU + causal-conv padding (reflect
+// in space, zero frames in front) in one pass, NDHWC in and out.
+//   stats_partial:  per (frame, 1024-row chunk, channel) sum / sum of squares
+//   stats_finalize: reduce to per-group mean, rstd
+//   apply:          normalize, silu, store into the padded output (reflected indices)
+// C % 8 == 0 (16-byte vectors). fp32 partial sums reduced in double, so results
+// agree with torch's Welford to fp32 rounding, not bitwise.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -213,9 +189,8 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
 
 }  // namespace
 
-// x/out: NDHWC (channels_last_3d) of [B, C, T, H, W] / [B, C, T+front, H+top+bottom, W+left+right].
-// gamma/beta: [C] in the same dtype, or both nullptr for pad-only. workspace:
-// (B*T*ceil(H*W/1024)*C + B*T*G) float2, unused without gamma.
+// x/out NDHWC; gamma/beta [C] or both nullptr for pad-only;
+// workspace (B*T*ceil(H*W/1024)*C + B*T*G) float2, unused without gamma.
 extern "C" void launch_group_norm_silu_pad3d(
     const void* x, const void* gamma, const void* beta, void* out, void* workspace,
     int B, int C, int T, int H, int W, int G, float eps,

@@ -1,29 +1,10 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
-// fp16-accumulate 3D convolution (implicit GEMM, NDHWC) with bias and an
-// optional residual fused into the epilogue: D = (acc + bias[k]) + residual.
-//
-// Same rationale as cutlass_gemm_fp16.cu: on sm_120 the fp32-accumulate HMMA
-// that cuDNN uses issues at half the rate of fp16-accumulate, and PyTorch has
-// no way to ask cuDNN for fp16 accumulation. Zero padding only -- callers
-// pre-pad (see group_norm_pad3d.cu, whose output layout this consumes
-// directly). Bias is broadcast through the epilogue's vector input; a missing
-// residual is a stride-0 view of a zero vector, so one kernel family serves
-// both cases.
+// fp16-accumulate NDHWC conv3d (CUTLASS implicit GEMM) with bias and an optional
+// residual in the epilogue. Zero padding only: callers pre-pad (group_norm_pad3d.cu).
+// Same opt-in numerics as cutlass_gemm_fp16.cu; a missing residual is a stride-0 zero vector.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>

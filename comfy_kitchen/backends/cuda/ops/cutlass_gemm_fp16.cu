@@ -2,18 +2,11 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * FP16 GEMM with FP16 accumulators via CUTLASS (EVT epilogue):
- *   D[m,n] = A[m,k] @ B[n,k]^T (+ bias[n]) [+ residual fused as
- *   D = resid + rscale[n] * (acc + bias)]
- *
- * On sm_120 the f32-accumulate HMMA issues at half the rate of the
- * f16-accumulate form, so this trades full-K fp16 accumulation (the same
- * numerics as torch's allow_fp16_accumulation / TensorRT's FP16 builder)
- * for ~2x tensor-core throughput. Callers must only route here when the
- * user has opted into fp16 accumulation. Tile configs benchmarked on the
- * H3 VAE decoder shapes (M~1.8k, N 2k-16k, K 2k-8k); deep-K shapes use the
- * lean stream-K swizzle. Returns false when no config can run; callers
- * fall back to cuBLAS.
+  * FP16 GEMM with fp16 accumulators via CUTLASS (EVT epilogue):
+  *   D = A @ B^T (+ bias), or resid + rscale * (acc + bias) fused.
+  * On sm_120 fp16-accumulate HMMA issues at twice the rate of fp32-accumulate;
+  * only route here when the user opted into fp16 accumulation (torch's
+  * allow_fp16_accumulation numerics). Returns false -> caller uses cuBLAS.
  */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -121,11 +114,8 @@ struct Fp16GemmResidual {
     }
 };
 
-// Tile configs benchmarked on sm_120 for the H3 decoder shapes (rankings hold
-// with weights streaming cold from DRAM and with the EVT epilogue attached);
-// 3 is stream-K for deep-K problems where plain data-parallel loses to cuBLAS.
-// select_fp16_config indexes THIS list; both epilogue variants' runner tables
-// are instantiated from it.
+// Benchmarked on sm_120 at the H3 decoder shapes; 2 is stream-K for deep K.
+// select_fp16_config indexes this list; both epilogue variants instantiate from it.
 using comfy_cutlass::TileConfig;
 using comfy_cutlass::ConfigList;
 using Fp16Configs = ConfigList<
@@ -133,10 +123,8 @@ using Fp16Configs = ConfigList<
     TileConfig<128, 128, 32, 64, 64, 32, 4>,                                     // 1
     TileConfig<128, 128, 32, 64, 64, 32, 4, 16, ThreadblockSwizzleLeanStreamK>>; // 2 (stream-K)
 
-// Launches with too few threadblocks cannot fill the GPU and lose to cuBLAS's
-// split-K by up to 10x (measured on sm_120: the plain tiles need ~96
-// threadblocks to break even, stream-K, which splits K itself, ~32). Returns
-// -1 for those so the caller hands the shape to cuBLAS.
+// Launches too small to fill the GPU lose to cuBLAS's split-K (up to 10x on
+// sm_120): plain tiles need ~96 threadblocks, stream-K ~32. -1 -> cuBLAS.
 constexpr int64_t kMinTilesPlain = 96;
 constexpr int64_t kMinTilesStreamK = 32;
 
@@ -201,10 +189,8 @@ bool dispatch_fp16_residual(const half_t* A, const half_t* B, const half_t* bias
     });
 }
 
-// Shape gate shared by both entry points. A zero-K linear is the bias
-// broadcast, and the tile table is tuned for decoder-tile M (~2k, or a few
-// tiles batched); at DiT sequence lengths cuBLAS wins. Both decline so the
-// caller computes them.
+// Shape gate for both entry points: a zero-K linear is the bias broadcast, and
+// past a few batched decoder tiles (M > 8192) cuBLAS wins. Both decline.
 bool fp16_gemm_shape_ok(int64_t M, int64_t N, int64_t K) {
     return K != 0 && K % 8 == 0 && N % 8 == 0 && M <= 8192;
 }

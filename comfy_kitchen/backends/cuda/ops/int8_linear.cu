@@ -1001,12 +1001,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     float* buf1 = buf0 + kConvRotGroup;
     float abs_max = 0.0f;
 
-    // RmsNorm needs the row-wide mean of squares before any value can be
-    // scaled, so it stages the raw row in row_buf (as float) while reducing.
-    // The FHT loop below then reads its 256-wide slice from row_buf and, two
-    // stages later, overwrites that same slice with the rotated values — the
-    // reads and writes of a slice belong to the same 64 threads with
-    // __syncthreads in between, so raw values are never clobbered early.
+    // RmsNorm needs the row's mean of squares first, so the raw row is staged in
+    // row_buf; the FHT loop reads its 256-wide slice and overwrites it two stages
+    // later, with __syncthreads between, so nothing is clobbered early.
     float rstd = 1.0f;
     if constexpr (ACT == kActRmsNorm) {
         float sum_sq = 0.0f;
