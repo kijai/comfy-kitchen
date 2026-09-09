@@ -19,6 +19,8 @@ def group_norm_silu_pad3d(
 ) -> Tensor:
     """Per-frame GroupNorm, optional SiLU, then reflect (l, r, t, b) and `front`
     zero frames of padding. weight=None skips the norm."""
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
     orig = x
     b, c, t, h, w = x.shape
     if weight is not None:
@@ -35,8 +37,10 @@ def group_norm_silu_pad3d(
         x = functional.pad(x, (left, right, top, bottom, 0, 0), mode="reflect")
     if front:
         x = functional.pad(x, (0, 0, 0, 0, front, 0))
+    # channels_last_3d like the CUDA backend (the registered fake promises it);
     # a custom op's output must not alias its input (nothing-to-do call)
-    return x if x is not orig else x.clone()
+    out = x.contiguous(memory_format=torch.channels_last_3d)
+    return out if out is not orig else out.clone()
 
 
 @torch.library.custom_op("comfy_kitchen::group_norm_silu_pad3d", mutates_args=())

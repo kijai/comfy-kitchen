@@ -199,8 +199,9 @@ extern "C" void launch_group_norm_silu_pad3d(
     if (C % kVec != 0 || kThreads % (C / kVec) != 0 || (gamma != nullptr && (C % G != 0 || G > 1024))) {
         throw std::runtime_error("group_norm_silu_pad3d: unsupported channel/group count");
     }
-    if (left >= W || right >= W || top >= H || bottom >= H) {
-        throw std::runtime_error("group_norm_silu_pad3d: reflect padding must be smaller than the input");
+    if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0
+        || left >= W || right >= W || top >= H || bottom >= H) {
+        throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative and smaller than the input");
     }
     // frames ride on grid.y; an oversize launch would fail silently and return `out` uninitialized
     if (static_cast<int64_t>(B) * (T + front) > 65535) {

@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from tests.conftest import fp16_accum_tol, rel_err
+from tests.conftest import cuda_backend_available, fp16_accum_tol, rel_err
 
 
 class TestFp16Linear:
@@ -26,6 +26,7 @@ class TestFp16Linear:
             (1797, 2048, 8192),
             (512, 512, 512),
             (37, 264, 128),
+            (37, 264, 0),   # zero-K linear is the bias broadcast; the kernel declines it
         ],
     )
     @pytest.mark.parametrize("with_bias", [True, False])
@@ -119,8 +120,8 @@ class TestFp16Linear:
     def test_small_launches_are_declined(self, m, n, k, served, seed, cuda_available):
         """The kernel declines launches too small to fill the GPU so the caller
         runs cuBLAS; the public op stays correct either way."""
-        if not cuda_available:
-            pytest.skip("CUDA required")
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
 
         x = torch.randn(m, k, dtype=torch.float16, device="cuda")

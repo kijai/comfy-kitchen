@@ -11,7 +11,7 @@ import torch
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda as cuda_backend
 from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
-from tests.conftest import requires_cuda_backend
+from tests.conftest import rel_err, requires_cuda_backend
 
 pytestmark = requires_cuda_backend
 
@@ -25,10 +25,6 @@ def _offset_view(t: torch.Tensor) -> torch.Tensor:
     return v
 
 
-def _max_rel(got, ref):
-    return ((got.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
-
-
 class TestW4A8Bias:
     @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("route", ["chunked", "two_pass"])
@@ -38,6 +34,11 @@ class TestW4A8Bias:
         # an asymmetric quant carries a correction, which forces the 2-pass route
         qdata, s_rel, s_channel, correction, cb = eager_w4a8.quantize_w4a8_int8_weight(
             w, symmetric=(route == "chunked"), codebook=(route == "chunked"))
+        if route == "chunked":  # the preconditions of the chunked branch, so both routes really run
+            assert cuda_backend._W4A8_CHUNKED and correction is None and s_rel.dtype == torch.float8_e4m3fn
+            assert hasattr(cuda_backend._C, "w4a8_codebook_linear_chunked")
+        else:
+            assert correction is not None
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn(n, device="cuda", dtype=torch.float32)  # fp32, as a module may keep it
         kwargs = {"codebook": cb, "correction": correction, "out_dtype": out_dtype}
@@ -49,7 +50,7 @@ class TestW4A8Bias:
 
         assert got.dtype == out_dtype
         # the bias add is the only difference from `plain`; rounding-level
-        assert _max_rel(got, plain.float() + bias) < 1e-2
+        assert rel_err(got, plain.float() + bias) < 1e-2
         # and the whole thing agrees with eager at int8 quantizer tolerance
         scale = ref.float().abs().max().item()
         assert (got.float() - ref.float()).abs().max().item() < 0.05 * scale
@@ -70,7 +71,7 @@ class TestInt4ViaInt8Bias:
                 x_int8, w_qdata, x_scale, w_scale, None, out_dtype)
             got = cuda_backend._int4_weight_int8_act_gemm_dequant_chunked(
                 x_int8, w_qdata, x_scale, w_scale, bias, out_dtype)
-            assert _max_rel(got, plain.float() + bias) < 1e-2
+            assert rel_err(got, plain.float() + bias) < 1e-2
 
     @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
     def test_int4_linear_accepts_a_model_dtype_bias(self, seed, out_dtype):
@@ -82,7 +83,7 @@ class TestInt4ViaInt8Bias:
         bias = torch.randn(n, device="cuda", dtype=out_dtype)
         plain = cuda_backend.int4_linear(x_q, w_q, x_s, w_s, None, out_dtype)
         got = cuda_backend.int4_linear(x_q, w_q, x_s, w_s, bias, out_dtype)
-        assert _max_rel(got, plain.float() + bias.float()) < 1e-2
+        assert rel_err(got, plain.float() + bias.float()) < 1e-2
 
 
 class TestVectorAlignment:

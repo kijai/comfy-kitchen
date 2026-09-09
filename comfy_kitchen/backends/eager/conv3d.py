@@ -18,7 +18,8 @@ def fp16_conv3d(
     """3D conv with zero padding plus an optional residual add (torch's
     accumulate mode; the CUDA backend accumulates in fp16)."""
     out = functional.conv3d(x, weight, bias, stride=stride)
-    return out if residual is None else out + residual
+    out = out if residual is None else out + residual
+    return out.contiguous(memory_format=torch.channels_last_3d)  # like the CUDA backend and the fake
 
 
 @torch.library.custom_op("comfy_kitchen::fp16_conv3d", mutates_args=())

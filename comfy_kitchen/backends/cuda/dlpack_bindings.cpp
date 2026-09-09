@@ -1726,10 +1726,13 @@ bool cutlass_fp16_conv3d(
     int64_t sd, int64_t sh, int64_t sw,
     uintptr_t stream_ptr, int64_t config = -1)
 {
-    const int64_t Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
+    if (sd <= 0 || sh <= 0 || sw <= 0) {
+        throw std::invalid_argument("cutlass_fp16_conv3d: strides must be positive");
+    }
     if (D < T || H < R || W < S) {
         throw std::invalid_argument("cutlass_fp16_conv3d: input smaller than the filter");
     }
+    const int64_t Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
     const int64_t out_size = N * Z * P * Q * K;
     if (static_cast<int64_t>(x.size()) != N * D * H * W * C ||
         static_cast<int64_t>(w.size()) != K * T * R * S * C ||

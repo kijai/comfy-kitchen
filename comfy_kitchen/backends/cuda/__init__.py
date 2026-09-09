@@ -2880,6 +2880,8 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
+    if min(sd, sh, sw) < 1:
+        return None  # torch's conv reports the bad stride
     z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
     supported = (
         x.dtype == torch.float16 and weight.dtype == torch.float16
@@ -2924,7 +2926,7 @@ def fp16_conv3d(
     out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride)
     if out is not None:
         return out
-    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride)
+    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(memory_format=torch.channels_last_3d)
     return out if residual is None else out + residual
 
 
@@ -2943,11 +2945,13 @@ def group_norm_silu_pad3d(
     left, right, top, bottom, front = pad
     # the affine params may be fp32 (the registry admits it); every path,
     # including torch's group_norm on the fallbacks, wants them in x's dtype
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
     if weight is not None:
         weight = weight.to(x.dtype).contiguous()
         bias = _zero_vector(c, x.device, x.dtype) if bias is None else bias.to(x.dtype).contiguous()
-    if (c % 8 or 256 % (c // 8) or (weight is not None and c % num_groups)
-            or max(left, right) >= w or max(top, bottom) >= h):
+    if (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+            or max(left, right) >= w or max(top, bottom) >= h or b * (t + front) > 65535):
         return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
 
     x = x.contiguous(memory_format=torch.channels_last_3d)

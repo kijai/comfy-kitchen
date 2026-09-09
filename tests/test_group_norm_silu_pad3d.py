@@ -78,6 +78,28 @@ class TestGroupNormSiluPad3d:
         ref = eager_ref(x, None, None, 1, 0.0, [1, 1, 1, 1, 2], False)
         assert torch.equal(got, ref)
 
+    def test_kernel_limits_fall_back(self, cuda_available):
+        """Group counts above 1024 and batch*frames above 65535 exceed the kernel's
+        launch limits and must take the eager path instead of raising."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x = torch.randn(1, 2048, 1, 4, 4, dtype=torch.float16, device="cuda")
+        w = torch.ones(2048, dtype=torch.float16, device="cuda")
+        got = ck.group_norm_silu_pad3d(x, w, None, 2048, 1e-6, (0, 0, 0, 0, 0), silu=False)
+        ref = torch.nn.functional.group_norm(x, 2048, w, None, 1e-6)
+        assert torch.allclose(got.float(), ref.float(), atol=1e-2)
+        x = torch.randn(1, 8, 65536, 1, 1, dtype=torch.float16, device="cuda")
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, 1), silu=False)
+        assert got.shape[2] == 65537 and torch.equal(got[:, :, 1:].float(), x.float())
+
+    def test_negative_padding_is_rejected(self, cuda_available):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
+        for backend in ("cuda", "eager"):
+            with ck.use_backend(backend), pytest.raises(ValueError):
+                ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False)
+
     def test_misaligned_input_falls_back(self, seed, cuda_available):
         """A 16-byte-misaligned view must not reach the vectorized kernel."""
         if not cuda_available:
@@ -100,6 +122,7 @@ class TestGroupNormSiluPad3d:
         bias = torch.zeros(128, dtype=torch.float16, device="cuda")
         ref = eager_ref(x, weight, bias, 32, 1e-6, [1, 1, 1, 1, 2], True)
         got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 2))
+        assert got.is_contiguous(memory_format=torch.channels_last_3d)
         assert rel_err(got.float(), ref.float()) < 5e-3
 
     @pytest.mark.parametrize("c", [128, 96])  # 96: C/8 is not a power of two -> eager fallback

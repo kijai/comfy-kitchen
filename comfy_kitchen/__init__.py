@@ -334,7 +334,7 @@ def group_norm_silu_pad3d(
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
-    zero frames in front. weight=None is pad-only. CUDA returns channels_last_3d.
+    zero frames in front. weight=None is pad-only. Output is channels_last_3d.
     """
     return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
 
@@ -943,7 +943,7 @@ def fp16_linear(
     Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
     route here only when the user opted into that mode.
     """
-    if not _fp16_linear_fills_gpu(x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]):
+    if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
         # below these sizes, and the dispatch alone would cost more than the call
         out = torch.nn.functional.linear(x, weight, bias)
