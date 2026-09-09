@@ -26,6 +26,8 @@ struct StreamWorkspace {
     size_t size = 0;
 };
 
+// One buffer per (device, stream), grown on demand and kept for the process
+// lifetime; assumes a stream is driven by one host thread at a time.
 inline void* get_stream_workspace(size_t size, cudaStream_t stream) {
     if (size == 0) return nullptr;
 
