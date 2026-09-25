@@ -1634,10 +1634,11 @@ def fp16_conv3d(
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    fp32_accumulate: bool = False,
 ) -> torch.Tensor:
-    """FP16 conv3d with fused bias/residual, channels_last_3d in and out; torch's
-    conv when the kernel declines the shape."""
-    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride)
+    """FP16 conv3d with fused bias/residual, channels_last_3d in and out. The WMMA kernel
+    accumulates in fp16, so fp32_accumulate and declined shapes run torch's conv."""
+    out = None if fp32_accumulate else _wmma_fp16_conv3d(x, weight, bias, residual, stride)
     if out is not None:
         return out
     # the kernel path takes bias and residual from any device, so the fallback must too
@@ -1648,8 +1649,8 @@ def fp16_conv3d(
     return out if residual is None else out + residual
 
 
-def fp16_conv3d_out(x, weight, bias, residual, stride, out) -> None:
-    out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
+def fp16_conv3d_out(x, weight, bias, residual, stride, out, fp32_accumulate=False) -> None:
+    out.copy_(fp16_conv3d(x, weight, bias, residual, stride, fp32_accumulate))
 
 
 def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:

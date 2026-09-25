@@ -121,6 +121,42 @@ class TestFp16Conv3d:
         assert cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual[:, :64], [1, 1, 1]) is None
 
 
+class TestFp32Accumulate:
+    """fp32_accumulate: torch's numerics with the epilogue still fused."""
+
+    # SeedVR2 decoder shapes: one-frame 1x3x3 at 128 and 256 channels, a 512-channel 3x3x3
+    @pytest.mark.parametrize(
+        "c,k,d,h,w,ksize",
+        [
+            (128, 128, 1, 130, 258, (1, 3, 3)),
+            (256, 256, 1, 130, 258, (1, 3, 3)),
+            (512, 512, 4, 66, 130, (3, 3, 3)),
+        ],
+    )
+    def test_matches_fp32_accum_reference(self, c, k, d, h, w, ksize, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        x, weight, bias, residual = _inputs(c, k, d, h, w, ksize, with_residual=True)
+        got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, [1, 1, 1], config=-2)
+        assert got is not None, "fused kernel declined a shape it should serve"
+        rel = rel_err(got.float(), _ref(x, weight, bias, residual, (1, 1, 1)))
+        assert rel < 1e-3, f"rel={rel:.2e}"
+
+    @pytest.mark.parametrize("fp32_accumulate", [False, True])
+    def test_residual_may_be_the_output(self, fp32_accumulate, seed, cuda_available):
+        """residual=out accumulates in place: one thread reads and writes each output element."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        x, weight, bias, residual = _inputs(128, 128, 1, 130, 258, (1, 3, 3), with_residual=True)
+        expected = _ref(x, weight, bias, residual, (1, 1, 1))
+        out = residual.clone(memory_format=CL3D)
+        ck.fp16_conv3d(x, weight, bias, residual=out, out=out, fp32_accumulate=fp32_accumulate)
+        tol = 1e-3 if fp32_accumulate else fp16_accum_tol(128 * 9)
+        assert rel_err(out.float(), expected) < tol
+
+
 class TestStridedViews:
     """NDHWC views in and frame windows out, so a memory-tiled conv needs no per-tile copies."""
 

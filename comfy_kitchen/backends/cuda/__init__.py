@@ -2949,8 +2949,8 @@ def _ndhwc_strides(t: torch.Tensor):
 
 def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None):
     """The fused kernel, or None when it does not apply to this call.
-    config forces a tile config (benchmarking); -1 selects by shape. x and out may be
-    NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
+    config: -1 picks an fp16-accumulate tile config by shape, -2 an fp32 one, >= 0 forces one.
+    x and out may be NDHWC-ordered views of larger tensors, so tiling needs no copies."""
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -3010,10 +3010,11 @@ def fp16_conv3d(
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    fp32_accumulate: bool = False,
 ) -> torch.Tensor:
-    """fp16-accumulate conv3d with fused bias/residual, channels_last_3d in and out;
-    torch's conv when the kernel declines the shape."""
-    out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride)
+    """fp16 conv3d with fused bias/residual, channels_last_3d in and out; torch's conv when
+    the kernel declines the shape."""
+    out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-2 if fp32_accumulate else -1)
     if out is not None:
         return out
     out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(memory_format=torch.channels_last_3d)
@@ -3027,9 +3028,10 @@ def fp16_conv3d_out(
     residual: torch.Tensor | None,
     stride: list[int],
     out: torch.Tensor,
+    fp32_accumulate: bool = False,
 ) -> None:
     """fp16_conv3d into ``out``; torch's conv plus a copy when the kernel declines the shape."""
-    if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
+    if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-2 if fp32_accumulate else -1, out=out) is not None:
         return
     res = torch.nn.functional.conv3d(x, weight, bias, stride=stride)
     out.copy_(res if residual is None else res + residual)

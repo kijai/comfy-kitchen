@@ -2,9 +2,10 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-// fp16-accumulate NDHWC conv3d (CUTLASS implicit GEMM) with bias and an optional
-// residual in the epilogue. Zero padding only: callers pre-pad (group_norm_pad3d.cu).
-// Same opt-in numerics as cutlass_gemm_fp16.cu; a missing residual is a stride-0 zero vector.
+// fp16 NDHWC conv3d (CUTLASS implicit GEMM) with bias and an optional residual in the
+// epilogue. Zero padding only: callers pre-pad (group_norm_pad3d.cu). Accumulates in fp16
+// (the opt-in numerics of cutlass_gemm_fp16.cu) or, on request, in fp32 like torch.
+// A missing residual is a stride-0 zero vector.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -100,7 +101,11 @@ struct Conv3dFp16 {
 using Conv0 = Conv3dFp16<128, 256, 64, 64, 3, half_t>;
 using Conv1 = Conv3dFp16<128, 128, 64, 64, 4, half_t>;
 using Conv2 = Conv3dFp16<64, 64, 32, 32, 4, float>;
-constexpr int kConvConfigCount = 3;
+// 3/4: fp32-accumulate (torch's numerics), 128x256 tiles from 256 output channels, 256x128
+// from 128. On SeedVR2's decoder 1.25-1.5x faster than cuDNN plus a separate residual add.
+using Conv3 = Conv3dFp16<128, 256, 64, 64, 3, float>;
+using Conv4 = Conv3dFp16<256, 128, 64, 64, 3, float>;
+constexpr int kConvConfigCount = 5;
 // 512 channels x 27 taps = 13824. At that depth fp16 accumulation costs the SeedVR2 decoder
 // 65.5 -> 57.8 dB against fp32 and buys 11-13% of decode time.
 constexpr int64_t kMaxFp16Depth = 16384;
@@ -127,9 +132,15 @@ int select_conv_config(int64_t m, int k, int64_t depth) {
     return -1;  // cuDNN
 }
 
+int select_fp32_conv_config(int64_t m, int k, int64_t depth) {
+    if (k >= 256 && conv_tiles<Conv3>(m, k) >= kMinTiles) return 3;
+    if (k >= 128 && conv_tiles<Conv4>(m, k) >= kMinTiles) return 4;
+    return depth > kDeepK && conv_tiles<Conv2>(m, k) >= kMinTilesSmall ? 2 : -1;
+}
+
 }  // namespace
 
-// config: -1 selects by shape; 0..2 force a config (benchmarking/tests).
+// config: -1 picks an fp16-accumulate config by shape, -2 an fp32 one; 0..4 force one.
 extern "C" bool launch_cutlass_fp16_conv3d(
     const void* x, const void* w, const void* bias, const void* resid, bool resid_full, void* out,
     int N, int D, int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q,
@@ -140,7 +151,9 @@ extern "C" bool launch_cutlass_fp16_conv3d(
     const Conv3dStrides st{xs_w, xs_h, xs_d, xs_n, os_w, os_h, os_d, os_n};
     if (d.C % 8 != 0 || d.K % 8 != 0 || config >= kConvConfigCount) return false;
     const int64_t m = static_cast<int64_t>(d.N) * d.Z * d.P * d.Q;
-    if (config < 0) config = select_conv_config(m, d.K, static_cast<int64_t>(d.C) * d.T * d.R * d.S);
+    const int64_t depth = static_cast<int64_t>(d.C) * d.T * d.R * d.S;
+    if (config == -2) config = select_fp32_conv_config(m, d.K, depth);
+    else if (config < 0) config = select_conv_config(m, d.K, depth);
     if (config < 0) return false;
     const auto xp = static_cast<const half_t*>(x);
     const auto wp = static_cast<const half_t*>(w);
@@ -150,7 +163,9 @@ extern "C" bool launch_cutlass_fp16_conv3d(
     switch (config) {
         case 0: return Conv0::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
         case 1: return Conv1::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
-        default: return Conv2::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
+        case 2: return Conv2::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
+        case 3: return Conv3::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
+        default: return Conv4::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
     }
 }
 
