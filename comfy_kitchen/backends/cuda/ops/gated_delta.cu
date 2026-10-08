@@ -14,6 +14,9 @@
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cstdint>
+#include "../prefetch_ring.h"
+
+__device__ PrefetchRingState* g_gated_delta_prefetch_ring = nullptr;
 
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
@@ -455,6 +458,9 @@ gated_delta_decode_deferred_kernel(
     #pragma unroll
     for (int r = 0; r < KPL; ++r)
         st[r] = state[state_off + tile_off + r * DV];
+    // ring consumption: this block's [DK, COLS] fp32 tile of the state, when the host listed it
+    if (t == 0 && g_gated_delta_prefetch_ring != nullptr && (g_gated_delta_prefetch_ring->credits & PREFETCH_RING_CREDIT_DELTA))
+        prefetch_ring_consume_device(g_gated_delta_prefetch_ring, static_cast<uint64_t>(DK) * COLS * sizeof(float));
 
     // gate projections of the current tokens (bf16 projection outputs, bf16 sigmoid,
     // fp32 softplus/exp, as in the eager chain) and the q/k sums of squares
@@ -936,6 +942,10 @@ bool fused_shmem_ok(const void* fn, int fn_slot, size_t shmem) {
 }
 
 }  // namespace
+
+extern "C" void set_gated_delta_prefetch_ring_state(PrefetchRingState* state) {
+    cudaMemcpyToSymbol(g_gated_delta_prefetch_ring, &state, sizeof(state));
+}
 
 extern "C" bool launch_gated_delta_decode_fused(
     const void* mixed_qkv, const void* x, const void* w_a, const void* w_b,
