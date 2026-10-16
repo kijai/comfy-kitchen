@@ -2663,13 +2663,23 @@ def w4a8_packed_linear(
         raise ValueError("w4a8_int8_linear: residual requires residual_scale")
     n = s_channel.numel()
     k = x.shape[-1] // _input_act_width(input_act)
+    m = x.numel() // x.shape[-1]
+    cluster_quantizer = _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    cooperative_quantizer = False
+    if (m <= 8 and x.dtype == torch.bfloat16 and convrot_groupsize == 256
+            and qdata.numel() == n * k * w4a8_mma_record_bytes(4) // 512
+            and _cuda_device_capability(x.device.index)[0] == 8):
+        with torch.cuda.device(x.device):
+            cooperative_quantizer = _C.convrot_cooperative_supported(
+                m, k, DTYPE_TO_CODE[x.dtype], _input_act_code(input_act)
+            )
     fuse_act = (
         input_act is not None
-        and x.numel() <= 8 * x.shape[-1]
-        and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+        and m <= 8
+        and (cluster_quantizer or cooperative_quantizer)
     ) or (
         input_act is not None
-        and x.numel() > 8 * x.shape[-1]
+        and m > 8
         and _w4a8_chunked_act_fusable(x, input_act, convrot_groupsize)
     )
     if input_act is not None and not fuse_act:
@@ -2702,11 +2712,11 @@ def w4a8_packed_linear(
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
-        # Staged-pair scratch is only needed where the single cluster quantizer
-        # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
+        # Cooperative blocks exchange maxima; only the staged fallback materializes rotation.
         rotated = partial_absmax = act_weight = None
-        if input_act is None and not _w4a8_cluster_quantizer_ok(k, None, x.device):
-            rotated = torch.empty_like(x_2d)
+        if not _w4a8_cluster_quantizer_ok(k, None, x.device):
+            if not cooperative_quantizer:
+                rotated = torch.empty_like(x_2d)
             partial_absmax = torch.empty(
                 m, k // convrot_groupsize, dtype=torch.float32, device=x.device
             )

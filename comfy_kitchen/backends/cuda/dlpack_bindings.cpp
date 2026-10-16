@@ -2497,6 +2497,12 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    bool launch_quantize_int8_convrot_cooperative_kernel(
+        const void* input, const void* act_weight, float act_eps, int act_code,
+        void* output, void* scales, void* maxima,
+        int64_t num_rows, int64_t num_cols, int input_dtype_code, cudaStream_t stream,
+        bool query_only);
+
     void launch_quantize_int8_rowwise_convrot64_kernel(
         const void* input,
         void* output,
@@ -3611,12 +3617,13 @@ bool w4a8_codebook_mma_linear(
             && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
                 || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
         throw std::runtime_error("w4a8_codebook_mma_linear rms_norm weight must be K contiguous elements in the input dtype");
-    if (rotated.has_value() != partial_absmax.has_value()
+    if ((rotated.has_value() && !partial_absmax.has_value())
             || (rotated.has_value()
                 && (rotated->shape(0) != M || rotated->shape(1) != K
                     || map_dtype_to_code(rotated->dtype()) != input_dtype_code
-                    || rotated->stride(1) != 1 || rotated->stride(0) != K
-                    || partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
+                    || rotated->stride(1) != 1 || rotated->stride(0) != K))
+            || (partial_absmax.has_value()
+                && (partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
                     || partial_absmax->stride(1) != 1
                     || partial_absmax->stride(0) != K / convrot_group_size)))
         throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
@@ -3652,11 +3659,15 @@ bool w4a8_codebook_mma_linear(
     if (!launch_quantize_int8_convrot_cluster_kernel(
             input.data(), has_act_weight ? act_weight->data() : nullptr,
             static_cast<float>(act_eps), static_cast<int>(act_code),
-            xq.data(), xs.data(), M, K, input_dtype_code, stream)) {
+            xq.data(), xs.data(), M, K, input_dtype_code, stream)
+            && !(bits == 4 && convrot_group_size == 256 && partial_absmax.has_value()
+                && launch_quantize_int8_convrot_cooperative_kernel(
+                    input.data(), has_act_weight ? act_weight->data() : nullptr,
+                    static_cast<float>(act_eps), static_cast<int>(act_code),
+                    xq.data(), xs.data(), partial_absmax->data(), M, K, input_dtype_code, stream, false))) {
         if (act_code != comfy::kActNone || !rotated.has_value())
             throw std::runtime_error(
-                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here "
-                "(needs sm_90+ and K % 256 == 0); apply the activation eagerly");
+                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here; apply the activation eagerly");
         launch_quantize_int8_convrot_staged_kernel(
             input.data(), rotated->data(), partial_absmax->data(), xq.data(), xs.data(), M, K,
             static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
@@ -5076,6 +5087,11 @@ NB_MODULE(_C, m) {
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false);
+
+    m.def("convrot_cooperative_supported", [](int64_t rows, int64_t cols, int dtype, int act) {
+        return launch_quantize_int8_convrot_cooperative_kernel(
+            nullptr, nullptr, 0.0f, act, nullptr, nullptr, nullptr, rows, cols, dtype, nullptr, true);
+    }, nb::arg("rows"), nb::arg("cols"), nb::arg("dtype"), nb::arg("act"));
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",
