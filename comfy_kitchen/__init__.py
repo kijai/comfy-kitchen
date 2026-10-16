@@ -48,6 +48,7 @@ from .tensor.convrot_w4a4 import (
     dequantize_convrot_w4a4_weight,
     quantize_convrot_w4a4_weight,
 )
+from .tensor import try_relayout_weights
 from .tensor.w4a8_int8 import (
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
@@ -134,6 +135,7 @@ __all__ = [
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "w4a8_int8_linear",
+    "try_relayout_weights",
     # Positional encoding
     "apply_rope",
     "apply_rope_",
