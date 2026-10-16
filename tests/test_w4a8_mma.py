@@ -281,6 +281,12 @@ class TestW4A8PackedMMA:
             assert torch.equal(unpacked_scales.view(torch.uint8), scales.view(torch.uint8))
             assert torch.all(storage[:64] == 73) and torch.all(storage[-128:] == 73)
 
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="resident MMA relayout needs sm_80+",
+)
+class TestResidentRelayout:
     @pytest.mark.parametrize("move_bytes", [1 << 20, 1 << 14, 1 << 12])
     @pytest.mark.parametrize("bits", [4, 6])
     def test_relayout_group_roundtrip(self, bits, move_bytes, seed, monkeypatch):
