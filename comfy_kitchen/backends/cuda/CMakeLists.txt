@@ -136,6 +136,7 @@ set(CUDA_SOURCES
     ops/turing_int4.cu
     ops/rms_rope.cu
     ops/na3d.cu
+    ops/gaussian_splat.cu
     sage_attention/sol_attn.cu
     sage_attention/sol_attn_preprocess.cu
     sage_attention/sol_attn_producer.cu

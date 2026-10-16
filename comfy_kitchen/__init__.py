@@ -21,6 +21,16 @@ from .flash_attention import is_available as flash_attention_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .gaussian_splat import (
+    bin_gaussians,
+    inject_position_noise_,
+    project_gaussians,
+    rasterize_gaussians,
+    sparse_adam_,
+    spherical_harmonics,
+    ssim_map,
+)
+from .gaussian_splat import is_available as gaussian_splat_is_available
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -76,6 +86,15 @@ __all__ = [
     "sol_attn",
     "sol_attn_chunked",
     "sol_attn_is_available",
+    # Gaussian splatting
+    "bin_gaussians",
+    "inject_position_noise_",
+    "project_gaussians",
+    "rasterize_gaussians",
+    "sparse_adam_",
+    "spherical_harmonics",
+    "ssim_map",
+    "gaussian_splat_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",

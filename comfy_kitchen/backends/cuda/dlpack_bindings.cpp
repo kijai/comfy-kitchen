@@ -266,6 +266,51 @@ extern "C" {
         int causal_t, int causal_h, int causal_w,
         float scale, int dtype_code, cudaStream_t stream);
 
+    // Gaussian splat kernels — see ops/gaussian_splat.cu.
+    void launch_gaussian_rasterize_fwd(
+        const void* means2d, const void* conics, const void* opacities, const void* colors,
+        const void* background, const void* boxes, const void* tile_offsets, const void* flatten_ids,
+        const void* chunk_offsets, int n_items, int n_tiles, int width, int height, int tiles_x, int chunk,
+        int channels, void* out, void* state, void* scratch, cudaStream_t stream);
+    void launch_gaussian_rasterize_bwd(
+        const void* means2d, const void* conics, const void* opacities, const void* colors,
+        const void* background, const void* boxes, const void* tile_offsets, const void* flatten_ids,
+        const void* out, const void* state, const void* chunk_offsets, const void* v_out, int n_items, int n_tiles,
+        int width, int height, int tiles_x, int chunk, int channels, void* v_means2d, void* v_conics,
+        void* v_opacities, void* v_colors, cudaStream_t stream);
+    void launch_gaussian_project_fwd(
+        const void* means, const void* scales, const void* quats, const void* opacities, const void* viewmat,
+        const void* K, int n, int width, int height, float near_plane, float far_plane, float dilation,
+        void* z, void* centre, void* conic, void* boxes, cudaStream_t stream);
+    void launch_gaussian_project_bwd(
+        const void* means, const void* scales, const void* quats, const void* viewmat, const void* K,
+        const void* v_centre, const void* v_conic,
+        int n, int width, int height, float near_plane, float far_plane, float dilation,
+        void* v_means, void* v_scales, void* v_quats, void* v_viewmat, cudaStream_t stream);
+    void launch_gaussian_bin_count(
+        const void* order, const void* boxes, int n, void* counts, cudaStream_t stream);
+    void launch_gaussian_bin(
+        const void* order, const void* boxes, const void* ends, int n, int tiles_x, int key_bytes,
+        void* keys, void* ids, cudaStream_t stream);
+    void launch_gaussian_sh_fwd(
+        const void* means, const void* campos, const void* sh0, const void* sh_rest, int n, int rest, int degree,
+        void* colors, cudaStream_t stream);
+    void launch_gaussian_sh_bwd(
+        const void* means, const void* campos, const void* sh0, const void* sh_rest, const void* v_colors, int n,
+        int rest, int degree, void* v_sh0, void* v_sh_rest, void* v_means, void* v_campos, cudaStream_t stream);
+    void launch_ssim_fwd(
+        const void* img1, const void* img2, int planes, int height, int width,
+        void* ssim_map, void* d_mu, void* d_xx, void* d_xy, cudaStream_t stream);
+    void launch_ssim_bwd(
+        const void* img1, const void* img2, const void* v_map, const void* d_mu, const void* d_xx, const void* d_xy,
+        int planes, int height, int width, void* v_img1, cudaStream_t stream);
+    void launch_gaussian_position_noise(
+        void* means, const void* scales, const void* quats, const void* opacities, const void* noise, int n,
+        float scale, cudaStream_t stream);
+    void launch_sparse_adam(
+        void* param, const void* grad, void* exp_avg, void* exp_avg_sq, const void* rows, int n, int row,
+        float beta1, float beta2, float step_size, float bias_correction2_sqrt, float eps, cudaStream_t stream);
+
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
     extern const char* const sol_attn_plan_names[];   // null-terminated
     int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap);
@@ -1516,6 +1561,225 @@ void na3d(
         (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
         (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
         scale, dtype_code, stream);
+}
+
+// Nanobind wrappers for the gaussian splat kernels, contiguous-only: the kernels index flat buffers
+using SplatF32 = nb::ndarray<float, nb::c_contig, nb::device::cuda>;
+using SplatI32 = nb::ndarray<int32_t, nb::c_contig, nb::device::cuda>;
+using SplatImage = nb::ndarray<float, nb::ndim<4>, nb::c_contig, nb::device::cuda>;
+
+void gaussian_rasterize_fwd(
+    SplatF32 means2d,
+    SplatF32 conics,
+    SplatF32 opacities,
+    SplatF32 colors,
+    SplatF32 background,
+    SplatI32 boxes,
+    SplatI32 tile_offsets,
+    SplatI32 flatten_ids,
+    SplatI32 chunk_offsets,
+    SplatF32 out,
+    SplatF32 state,
+    nb::ndarray<uint8_t, nb::c_contig, nb::device::cuda> scratch,
+    int64_t n_items, int64_t width, int64_t height, int64_t tiles_x, int64_t chunk,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_rasterize_fwd(
+        means2d.data(), conics.data(), opacities.data(), colors.data(), background.data(), boxes.data(),
+        tile_offsets.data(), flatten_ids.data(), chunk_offsets.data(), (int)n_items,
+        (int)tile_offsets.size() - 1, (int)width, (int)height, (int)tiles_x, (int)chunk, (int)colors.shape(1),
+        out.data(), state.data(), scratch.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_rasterize_bwd(
+    SplatF32 means2d,
+    SplatF32 conics,
+    SplatF32 opacities,
+    SplatF32 colors,
+    SplatF32 background,
+    SplatI32 boxes,
+    SplatI32 tile_offsets,
+    SplatI32 flatten_ids,
+    SplatF32 out,
+    SplatF32 state,
+    SplatI32 chunk_offsets,
+    SplatF32 v_out,
+    SplatF32 v_means2d,
+    SplatF32 v_conics,
+    SplatF32 v_opacities,
+    SplatF32 v_colors,
+    int64_t n_items, int64_t width, int64_t height, int64_t tiles_x, int64_t chunk,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_rasterize_bwd(
+        means2d.data(), conics.data(), opacities.data(), colors.data(), background.data(), boxes.data(),
+        tile_offsets.data(), flatten_ids.data(), out.data(), state.data(), chunk_offsets.data(), v_out.data(),
+        (int)n_items, (int)tile_offsets.size() - 1, (int)width, (int)height, (int)tiles_x, (int)chunk,
+        (int)colors.shape(1), v_means2d.data(), v_conics.data(), v_opacities.data(), v_colors.data(),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_project_fwd(
+    SplatF32 means,
+    SplatF32 scales,
+    SplatF32 quats,
+    SplatF32 opacities,
+    SplatF32 viewmat,
+    SplatF32 K,
+    SplatF32 z,
+    SplatF32 centre,
+    SplatF32 conic,
+    SplatI32 boxes,
+    int64_t width, int64_t height, float near_plane, float far_plane, float dilation,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_project_fwd(
+        means.data(), scales.data(), quats.data(), opacities.data(), viewmat.data(), K.data(), (int)means.shape(0),
+        (int)width, (int)height, near_plane, far_plane, dilation,
+        z.data(), centre.data(), conic.data(), boxes.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_project_bwd(
+    SplatF32 means,
+    SplatF32 scales,
+    SplatF32 quats,
+    SplatF32 viewmat,
+    SplatF32 K,
+    SplatF32 v_centre,
+    SplatF32 v_conic,
+    SplatF32 v_means,
+    SplatF32 v_scales,
+    SplatF32 v_quats,
+    SplatF32 v_viewmat,
+    int64_t width, int64_t height, float near_plane, float far_plane, float dilation,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_project_bwd(
+        means.data(), scales.data(), quats.data(), viewmat.data(), K.data(),
+        v_centre.data(), v_conic.data(), (int)means.shape(0), (int)width, (int)height, near_plane, far_plane,
+        dilation, v_means.data(), v_scales.data(), v_quats.data(), v_viewmat.data(),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_bin_count(
+    nb::ndarray<int64_t, nb::c_contig, nb::device::cuda> order,
+    SplatI32 boxes,
+    SplatI32 counts,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_bin_count(
+        order.data(), boxes.data(), (int)order.shape(0), counts.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// keys are int16 or int32, whichever holds the tile count
+void gaussian_bin(
+    nb::ndarray<int64_t, nb::c_contig, nb::device::cuda> order,
+    SplatI32 boxes,
+    SplatI32 ends,
+    nb::ndarray<nb::c_contig, nb::device::cuda> keys,
+    SplatI32 ids,
+    int64_t tiles_x,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_bin(
+        order.data(), boxes.data(), ends.data(), (int)order.shape(0), (int)tiles_x,
+        keys.dtype() == nb::dtype<int16_t>() ? 2 : 4, keys.data(), ids.data(),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_sh_fwd(
+    SplatF32 means,
+    SplatF32 campos,
+    SplatF32 sh0,
+    SplatF32 sh_rest,
+    SplatF32 colors,
+    int64_t degree,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_sh_fwd(
+        means.data(), campos.data(), sh0.data(), sh_rest.data(), (int)sh0.shape(0), (int)sh_rest.shape(1),
+        (int)degree, colors.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_sh_bwd(
+    SplatF32 means,
+    SplatF32 campos,
+    SplatF32 sh0,
+    SplatF32 sh_rest,
+    SplatF32 v_colors,
+    SplatF32 v_sh0,
+    SplatF32 v_sh_rest,
+    SplatF32 v_means,
+    SplatF32 v_campos,
+    int64_t degree,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_sh_bwd(
+        means.data(), campos.data(), sh0.data(), sh_rest.data(), v_colors.data(), (int)sh0.shape(0),
+        (int)sh_rest.shape(1), (int)degree, v_sh0.data(), v_sh_rest.data(), v_means.data(), v_campos.data(),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// (B, C, H, W) images; the partials are (3, B, C, H, W)
+void ssim_fwd(
+    SplatImage img1,
+    SplatImage img2,
+    SplatImage ssim_map,
+    SplatF32 partials,
+    uintptr_t stream_ptr)
+{
+    const int planes = (int)(img1.shape(0) * img1.shape(1));
+    const int height = (int)img1.shape(2), width = (int)img1.shape(3);
+    float* d = static_cast<float*>(partials.data());
+    const size_t n = (size_t)planes * height * width;
+    launch_ssim_fwd(img1.data(), img2.data(), planes, height, width, ssim_map.data(), d, d + n, d + 2 * n,
+                    reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void ssim_bwd(
+    SplatImage img1,
+    SplatImage img2,
+    SplatImage v_map,
+    SplatF32 partials,
+    SplatImage v_img1,
+    uintptr_t stream_ptr)
+{
+    const int planes = (int)(img1.shape(0) * img1.shape(1));
+    const int height = (int)img1.shape(2), width = (int)img1.shape(3);
+    const float* d = static_cast<const float*>(partials.data());
+    const size_t n = (size_t)planes * height * width;
+    launch_ssim_bwd(img1.data(), img2.data(), v_map.data(), d, d + n, d + 2 * n, planes, height, width,
+                    v_img1.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void gaussian_position_noise(
+    SplatF32 means,
+    SplatF32 scales,
+    SplatF32 quats,
+    SplatF32 opacities,
+    SplatF32 noise,
+    float scale,
+    uintptr_t stream_ptr)
+{
+    launch_gaussian_position_noise(
+        means.data(), scales.data(), quats.data(), opacities.data(), noise.data(), (int)means.shape(0), scale,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void sparse_adam(
+    SplatF32 param,
+    SplatF32 grad,
+    SplatF32 exp_avg,
+    SplatF32 exp_avg_sq,
+    nb::ndarray<bool, nb::c_contig, nb::device::cuda> rows,
+    float beta1, float beta2, float step_size, float bias_correction2_sqrt, float eps,
+    uintptr_t stream_ptr)
+{
+    const int n = (int)param.size();
+    launch_sparse_adam(
+        param.data(), grad.data(), exp_avg.data(), exp_avg_sq.data(), rows.data(), n,
+        rows.shape(0) ? n / (int)rows.shape(0) : 1, beta1, beta2, step_size, bias_correction2_sqrt, eps,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrappers for Sol-Attn sparse attention
@@ -4486,6 +4750,78 @@ NB_MODULE(_C, m) {
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("gaussian_rasterize_fwd", &gaussian_rasterize_fwd,
+          "Tile-based gaussian splat compositing, forward (3 or 5 float32 channels)",
+          nb::arg("means2d"), nb::arg("conics"), nb::arg("opacities"), nb::arg("colors"),
+          nb::arg("background"), nb::arg("boxes"), nb::arg("tile_offsets"), nb::arg("flatten_ids"),
+          nb::arg("chunk_offsets"), nb::arg("out"), nb::arg("state"), nb::arg("scratch"),
+          nb::arg("n_items"), nb::arg("width"), nb::arg("height"), nb::arg("tiles_x"), nb::arg("chunk"),
+          nb::arg("stream_ptr"));
+
+    m.def("gaussian_rasterize_bwd", &gaussian_rasterize_bwd,
+          "Tile-based gaussian splat compositing, backward (3 or 5 float32 channels)",
+          nb::arg("means2d"), nb::arg("conics"), nb::arg("opacities"), nb::arg("colors"),
+          nb::arg("background"), nb::arg("boxes"), nb::arg("tile_offsets"), nb::arg("flatten_ids"),
+          nb::arg("out"), nb::arg("state"), nb::arg("chunk_offsets"),
+          nb::arg("v_out"), nb::arg("v_means2d"), nb::arg("v_conics"), nb::arg("v_opacities"), nb::arg("v_colors"),
+          nb::arg("n_items"), nb::arg("width"), nb::arg("height"), nb::arg("tiles_x"), nb::arg("chunk"),
+          nb::arg("stream_ptr"));
+
+    m.def("gaussian_project_fwd", &gaussian_project_fwd,
+          "Gaussian splat EWA projection to conics and pixel boxes, forward (float32)",
+          nb::arg("means"), nb::arg("scales"), nb::arg("quats"), nb::arg("opacities"), nb::arg("viewmat"),
+          nb::arg("K"), nb::arg("z"), nb::arg("centre"), nb::arg("conic"), nb::arg("boxes"),
+          nb::arg("width"), nb::arg("height"), nb::arg("near_plane"), nb::arg("far_plane"), nb::arg("dilation"),
+          nb::arg("stream_ptr"));
+
+    m.def("gaussian_project_bwd", &gaussian_project_bwd,
+          "Gaussian splat EWA projection to conics, backward (float32)",
+          nb::arg("means"), nb::arg("scales"), nb::arg("quats"), nb::arg("viewmat"), nb::arg("K"),
+          nb::arg("v_centre"), nb::arg("v_conic"),
+          nb::arg("v_means"), nb::arg("v_scales"), nb::arg("v_quats"), nb::arg("v_viewmat"),
+          nb::arg("width"), nb::arg("height"), nb::arg("near_plane"), nb::arg("far_plane"), nb::arg("dilation"),
+          nb::arg("stream_ptr"));
+
+    m.def("gaussian_bin_count", &gaussian_bin_count,
+          "Number of 16x16 tiles each gaussian splat's pixel box spans, in depth order",
+          nb::arg("order"), nb::arg("boxes"), nb::arg("counts"), nb::arg("stream_ptr"));
+
+    m.def("gaussian_bin", &gaussian_bin,
+          "Gaussian splat (tile, id) pairs in depth order, for a stable sort by tile",
+          nb::arg("order"), nb::arg("boxes"), nb::arg("ends"), nb::arg("keys"), nb::arg("ids"),
+          nb::arg("tiles_x"), nb::arg("stream_ptr"));
+
+    m.def("gaussian_sh_fwd", &gaussian_sh_fwd,
+          "Spherical harmonics to degree 3 from band 0 and the higher bands, forward (float32)",
+          nb::arg("means"), nb::arg("campos"), nb::arg("sh0"), nb::arg("sh_rest"), nb::arg("colors"),
+          nb::arg("degree"), nb::arg("stream_ptr"));
+
+    m.def("gaussian_sh_bwd", &gaussian_sh_bwd,
+          "Spherical harmonics to degree 3 from band 0 and the higher bands, backward (float32)",
+          nb::arg("means"), nb::arg("campos"), nb::arg("sh0"), nb::arg("sh_rest"), nb::arg("v_colors"),
+          nb::arg("v_sh0"), nb::arg("v_sh_rest"), nb::arg("v_means"), nb::arg("v_campos"), nb::arg("degree"),
+          nb::arg("stream_ptr"));
+
+    m.def("ssim_fwd", &ssim_fwd,
+          "11x11 gaussian-window SSIM map, forward (float32)",
+          nb::arg("img1"), nb::arg("img2"), nb::arg("ssim_map"), nb::arg("partials"), nb::arg("stream_ptr"));
+
+    m.def("ssim_bwd", &ssim_bwd,
+          "11x11 gaussian-window SSIM map, backward to img1 (float32)",
+          nb::arg("img1"), nb::arg("img2"), nb::arg("v_map"), nb::arg("partials"), nb::arg("v_img1"),
+          nb::arg("stream_ptr"));
+
+    m.def("gaussian_position_noise", &gaussian_position_noise,
+          "3DGS-MCMC covariance-shaped position noise, in place (float32)",
+          nb::arg("means"), nb::arg("scales"), nb::arg("quats"), nb::arg("opacities"), nb::arg("noise"),
+          nb::arg("scale"), nb::arg("stream_ptr"));
+
+    m.def("sparse_adam", &sparse_adam,
+          "Adam step on the selected rows of a float32 parameter, in place",
+          nb::arg("param"), nb::arg("grad"), nb::arg("exp_avg"), nb::arg("exp_avg_sq"), nb::arg("rows"),
+          nb::arg("beta1"), nb::arg("beta2"), nb::arg("step_size"), nb::arg("bias_correction2_sqrt"), nb::arg("eps"),
+          nb::arg("stream_ptr"));
 
     m.def("gated_delta_decode_fused", &gated_delta_decode_fused,
           "GatedDeltaNet decode with gate projections, gate math and q/k normalization folded in",
