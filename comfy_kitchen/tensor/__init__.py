@@ -17,7 +17,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .fp8 import TensorCoreFP8Layout
-from .int8 import TensorWiseINT8Layout
+from .int8 import TensorWiseINT8Layout, try_relayout_int8_weights
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
 from .svdquant_w4a4 import (
@@ -79,6 +79,10 @@ def try_relayout_weights(weights, storage):
         isinstance(w, QuantizedTensor) and w._layout_cls == "AsymW4A8Int8Layout" for w in weights
     ):
         return try_relayout_w4a8_weights(weights, storage)
+    if weights and all(
+        isinstance(w, QuantizedTensor) and w._layout_cls == "TensorWiseINT8Layout" for w in weights
+    ):
+        return try_relayout_int8_weights(weights, storage)
     return NotImplemented
 
 
