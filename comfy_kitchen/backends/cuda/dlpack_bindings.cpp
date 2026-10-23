@@ -18,6 +18,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstring>
@@ -2492,7 +2493,8 @@ extern "C" {
 
     void launch_pack_w4a8_mma_inplace(
         void* data, const void* scales, void* scratch,
-        int64_t N, int64_t K, int bits, cudaStream_t stream);
+        const int64_t* offsets, const int64_t* tiles, const int64_t* zones, int segments,
+        int64_t K, int bits, cudaStream_t stream);
 
     bool launch_w4a8_codebook_gemm_chunked(
         const void* xq,
@@ -3597,19 +3599,42 @@ bool quantize_wxa8_convrot_fused(
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+// Canonical code segments at byte offsets of data, rows[s] rows each, become one
+// record stream at data's start. zones[s] is the count of bottom slabs of segment s
+// whose records would not sit entirely above their own codes; they are saved to
+// scratch, which holds one slab per zone entry.
 void pack_w4a8_mma_inplace(
     nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> data,
     nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> scales,
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> scratch,
+    std::vector<int64_t> offsets, std::vector<int64_t> rows, std::vector<int64_t> zones, int bits,
     uintptr_t stream_ptr) {
     const int64_t N = scales.shape(0), K = scales.shape(1) * 16;
-    const int bits = data.size() == N * K * 9 / 16 ? 4 : (data.size() == N * K * 13 / 16 ? 6 : 0);
-    if (!bits || N <= 0 || N % 16 || K <= 0 || K % 256
-            || data.stride(0) != 1 || scales.stride(1) != 1 || scales.stride(0) != K / 16
-            || scratch.stride(0) != 1 || scratch.size() < static_cast<size_t>(2 * K * bits))
-        throw std::runtime_error("pack_w4a8_mma_inplace: invalid storage or scratch geometry");
+    const int64_t slab = 2 * K * bits, record = slab + K;
+    const int segments = static_cast<int>(offsets.size());
+    if ((bits != 4 && bits != 6) || N <= 0 || N % 16 || K <= 0 || K % 256 || !segments
+            || rows.size() != offsets.size() || zones.size() != offsets.size()
+            || data.stride(0) != 1 || scales.stride(1) != 1 || scales.stride(0) != K / 16 || scratch.stride(0) != 1
+            || static_cast<int64_t>(data.size()) < N / 16 * record)
+        throw std::runtime_error("pack_w4a8_mma_inplace: invalid storage geometry");
+    std::vector<int64_t> tiles(segments);
+    int64_t t0 = 0, end = 0, kept = 0;
+    for (int s = 0; s < segments; ++s) {
+        tiles[s] = rows[s] / 16;
+        if (rows[s] <= 0 || rows[s] % 16 || offsets[s] < end || (s == 0 && offsets[s] != 0)
+                || offsets[s] + tiles[s] * slab > static_cast<int64_t>(data.size())
+                || zones[s] < 0 || zones[s] > tiles[s]
+                || (zones[s] < tiles[s] && offsets[s] + (zones[s] + 1) * slab > (t0 + zones[s]) * record))
+            throw std::runtime_error("pack_w4a8_mma_inplace: segments must be ordered, disjoint and zoned");
+        end = offsets[s] + tiles[s] * slab;
+        kept += zones[s] * slab;
+        t0 += tiles[s];
+    }
+    if (t0 * 16 != N || static_cast<int64_t>(scratch.size()) < kept)
+        throw std::runtime_error("pack_w4a8_mma_inplace: segment rows must total N with scratch for every zone slab");
     launch_pack_w4a8_mma_inplace(data.data(), scales.data(), scratch.data(),
-        N, K, bits, reinterpret_cast<cudaStream_t>(stream_ptr));
+        offsets.data(), tiles.data(), zones.data(), segments, K, bits,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
@@ -5050,8 +5075,9 @@ NB_MODULE(_C, m) {
           nb::arg("bits"), nb::arg("group_size"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
 
     m.def("pack_w4a8_mma_inplace", &pack_w4a8_mma_inplace,
-          "In-place backwards slab expansion into tiled codes and interleaved scales",
-          nb::arg("data"), nb::arg("scales"), nb::arg("scratch"), nb::arg("stream_ptr"));
+          "In-place slab expansion of ordered code segments into one record stream",
+          nb::arg("data"), nb::arg("scales"), nb::arg("scratch"), nb::arg("offsets"), nb::arg("rows"),
+          nb::arg("zones"), nb::arg("bits"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",

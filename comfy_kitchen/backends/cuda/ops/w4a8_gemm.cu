@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <algorithm>
 #include <type_traits>
 #include <limits>
 #include <stdexcept>
@@ -497,22 +498,16 @@ void launch_dequant_grouped_to_int8(
             static_cast<const float*>(codebook),
             static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
 }
-// Non-overlapping backwards batches pack directly from source to destination.
-// Only the bottom slabs overlap: one CTA saves each of those before expanding it.
-template <int BITS, bool OVERLAP>
+// Expand canonical 16-row slabs [first, last) into their records at tile * record
+// stride of data. Slab tile t is read at src + (t - t0) * slab bytes; the caller
+// schedules batches whose reads and writes never overlap.
+template <int BITS>
 __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
-                                     uint8_t* scratch, int first, int last, int K) {
-    constexpr int code_bytes = 512 * BITS / 8, record_bytes = code_bytes + 32;
-    constexpr int parts = OVERLAP ? 1 : 8;
+                                     const uint8_t* src, int t0, int first, int last, int K) {
+    constexpr int code_bytes = 512 * BITS / 8, record_bytes = code_bytes + 32, parts = 8;
     const int row_bytes = K * BITS / 8, slab_bytes = 16 * row_bytes, k_rows = K / 32;
     for (int tile = last - 1 - blockIdx.x / parts; tile >= first; tile -= gridDim.x / parts) {
-        const uint8_t* slab = data + (int64_t)tile * slab_bytes;
-        if constexpr (OVERLAP) {
-            for (int i = threadIdx.x; i < slab_bytes / 4; i += blockDim.x)
-                reinterpret_cast<unsigned*>(scratch)[i] = reinterpret_cast<const unsigned*>(slab)[i];
-            __syncthreads();
-            slab = scratch;
-        }
+        const uint8_t* slab = src + (int64_t)(tile - t0) * slab_bytes;
         for (int i = threadIdx.x + (blockIdx.x % parts) * blockDim.x; i < k_rows * record_bytes; i += blockDim.x * parts) {
             const int kr = i / record_bytes, b = i % record_bytes;
             uint8_t value;
@@ -541,8 +536,14 @@ __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
             }
             data[(int64_t)tile * k_rows * record_bytes + i] = value;
         }
-        if constexpr (OVERLAP) __syncthreads();
     }
+}
+
+template <int BITS>
+static void launch_pack_w4a8_slabs(uint8_t* data, const uint8_t* scales, const uint8_t* src,
+                                   int t0, int first, int last, int K, cudaStream_t stream) {
+    if (last > first)
+        pack_w4a8_slabs_kernel<BITS><<<(last - first) * 8, 256, 0, stream>>>(data, scales, src, t0, first, last, K);
 }
 
 // Read record-stream weights directly into one canonical INT8 GEMM chunk.
@@ -590,26 +591,46 @@ __global__ void dequant_w4a8_mma_chunk_kernel(
 }
 }  // namespace
 
+// Pack ordered canonical segments of data into one record stream at its start.
+// Segment s holds tiles[s] slabs at offsets[s]; its bottom zones[s] slabs are
+// the ones whose records would overlap or sit below their own codes. Those are
+// saved to scratch first, so the remaining slabs expand in place backwards, top
+// segment first, in batches whose records all sit above every unread slab; the
+// saved slabs then expand last, after every slab under their records was read.
 extern "C" void launch_pack_w4a8_mma_inplace(
     void* data, const void* scales, void* scratch,
-    int64_t N, int64_t K, int bits, cudaStream_t stream) {
+    const int64_t* offsets, const int64_t* tiles, const int64_t* zones, int segments,
+    int64_t K, int bits, cudaStream_t stream) {
     auto* bytes = static_cast<uint8_t*>(data);
-    auto* temp = static_cast<uint8_t*>(scratch);
-    int last = N / 16;
-    while (last > 2 * bits) {
-        // first * expanded_slab_bytes >= last * canonical_slab_bytes:
-        // the entire destination batch is above its entire source batch.
-        const int first = (last * (2 * bits) + 2 * bits) / (2 * bits + 1);
+    auto* saved = static_cast<uint8_t*>(scratch);
+    const auto* codes = static_cast<const uint8_t*>(scales);
+    const int64_t slab = 2 * K * bits, record = slab + K;
+    auto launch = [&](const uint8_t* src, int t0, int first, int last) {
         if (bits == 4)
-            pack_w4a8_slabs_kernel<4, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
+            launch_pack_w4a8_slabs<4>(bytes, codes, src, t0, first, last, K, stream);
         else
-            pack_w4a8_slabs_kernel<6, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
-        last = first;
+            launch_pack_w4a8_slabs<6>(bytes, codes, src, t0, first, last, K, stream);
+    };
+    int64_t total = 0, kept = 0;
+    for (int s = 0; s < segments; ++s) {
+        if (zones[s])
+            cudaMemcpyAsync(saved + kept, bytes + offsets[s], zones[s] * slab, cudaMemcpyDeviceToDevice, stream);
+        kept += zones[s] * slab;
+        total += tiles[s];
     }
-    if (bits == 4)
-        pack_w4a8_slabs_kernel<4, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
-    else
-        pack_w4a8_slabs_kernel<6, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
+    for (int s = segments - 1, t0 = total; s >= 0; --s) {
+        t0 -= tiles[s];
+        for (int last = t0 + tiles[s], stop = t0 + zones[s]; last > stop;) {
+            const int64_t unread = offsets[s] + (last - t0) * slab;
+            const int first = std::max<int64_t>(stop, (unread + record - 1) / record);
+            launch(bytes + offsets[s], t0, first, last);
+            last = first;
+        }
+    }
+    for (int s = 0, t0 = 0; s < segments; t0 += tiles[s], ++s) {
+        launch(saved, t0, t0, t0 + zones[s]);
+        saved += zones[s] * slab;
+    }
 }
 
 static void launch_dequant_w4a8_mma_chunk(

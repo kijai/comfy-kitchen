@@ -269,8 +269,8 @@ class TestW4A8PackedMMA:
                     allocated = torch.cuda.memory_allocated()
                 packed = weight.optimize_for_gemv(storage)
                 if not results:
-                    # No full-weight temporary: saved scales plus one slab.
-                    assert torch.cuda.max_memory_allocated() - allocated <= scales.nbytes + (1 << 20)
+                    # No full-weight temporary: saved scales plus the bottom 2 * bits slabs.
+                    assert torch.cuda.max_memory_allocated() - allocated <= scales.nbytes + 4 * k * bits * bits + 1024
                 results.append((storage, packed))
         for stream in streams:
             torch.cuda.current_stream().wait_stream(stream)
@@ -287,13 +287,38 @@ class TestW4A8PackedMMA:
     reason="resident MMA relayout needs sm_80+",
 )
 class TestResidentRelayout:
-    @pytest.mark.parametrize("move_bytes", [1 << 20, 1 << 14, 1 << 12])
+    @pytest.mark.parametrize("gaps", [(0, 0), (64, 2048), (300000, 16)])
     @pytest.mark.parametrize("bits", [4, 6])
-    def test_relayout_group_roundtrip(self, bits, move_bytes, seed, monkeypatch):
+    def test_segments_pack_in_place(self, bits, gaps, seed):
+        # Segments spaced by arbitrary gaps: adjacent codes whose records overlap the
+        # next segment's codes, a gap wider than the following segments so every one
+        # of their slabs is saved, and a single-slab segment. Every record must equal
+        # the canonical codes and scales, with no write outside the record stream.
+        k, rows = 512, (48, 16, 160)
+        slab = 2 * k * bits
+        q = [torch.randint(-128, 128, (n, k * bits // 8), device="cuda", dtype=torch.int8) for n in rows]
+        s = [torch.randint(0, 256, (n, k // 16), device="cuda", dtype=torch.uint8) for n in rows]
+        offsets, cursor = [], 0
+        for n, gap in zip(rows, (0, *gaps), strict=True):
+            cursor += gap
+            offsets.append(cursor)
+            cursor += n * slab // 16
+        records = sum(rows) * k * (2 * bits + 1) // 16
+        storage = torch.full((64 + max(cursor, records) + 128,), 73, device="cuda", dtype=torch.uint8)
+        qdata = []
+        for offset, codes in zip(offsets, q, strict=True):
+            qdata.append(storage[64 + offset:64 + offset + codes.nbytes].view(torch.int8).view_as(codes).copy_(codes))
+        packed = cuda_backend.pack_w4a8_mma_weights_(storage, qdata, [t.view(torch.float8_e4m3fn) for t in s])
+        assert packed.data_ptr() == storage.data_ptr() + 64 and packed.numel() == records
+        unpacked_q, unpacked_s = unpack_w4a8_mma_weight(packed, sum(rows), k)
+        assert torch.equal(unpacked_q, torch.cat(q))
+        assert torch.equal(unpacked_s.view(torch.uint8), torch.cat(s))
+        assert torch.all(storage[:64] == 73) and torch.all(storage[-128:] == 73)
+
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_relayout_group_roundtrip(self, bits, seed):
         # Asymmetric row counts in one resident span become one packed weight at the
-        # first codes; the views are its row slices. The move buffer sizes cover single
-        # bounced chunks, several bounced chunks, and direct chunks of the shift size.
-        monkeypatch.setattr(cuda_backend, "_W4A8_MOVE_BYTES", move_bytes)
+        # first codes; the views are its row slices.
         k, rows = 1024, (64, 256, 48)
         buf, span, members, refs = _resident_group([(n, k, bits) for n in rows])
         head = span[:256].clone()
@@ -305,8 +330,8 @@ class TestResidentRelayout:
         torch.cuda.reset_peak_memory_stats()
         allocated = torch.cuda.memory_allocated()
         combined, views = ck.try_relayout_weights(tuple(members), span)
-        # Saved scales, the move buffer, one slab and channel scales; no weight copy.
-        assert torch.cuda.max_memory_allocated() - allocated <= scale_bytes + move_bytes + (64 << 10)
+        # Saved scales, the bottom 2 * bits slabs per member and channel scales; no weight copy.
+        assert torch.cuda.max_memory_allocated() - allocated <= scale_bytes + 3 * 4 * k * bits * bits + (64 << 10)
 
         assert combined._qdata.data_ptr() == start and combined.shape == (sum(rows), k)
         assert combined.params.mma_packed and len(views) == len(refs)
