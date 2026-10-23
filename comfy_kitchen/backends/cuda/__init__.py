@@ -2084,7 +2084,8 @@ def _w4a8_mma_linear(
     """Quantize x_2d and run the streamed MMA GEMM into out."""
     m, n = out.shape
     # Call-local split-K sums and counters also isolate independently replayed graphs.
-    scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
+    # the binding zeroes it (inside the quantizer launch), so no fill kernel here
+    scratch = torch.empty(m * n + n // 16, dtype=torch.int32, device=out.device)
     workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
     bits = _mma_bits(qdata.numel(), n, xq.shape[1])
     decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
@@ -2501,6 +2502,10 @@ def _pack_w4a8_mma_records_(data: torch.Tensor, scales: torch.Tensor, offsets: l
         zones.append(min(n // 16, max(0, -(-(offset - t0 * record + slab) // k))))
         t0 += n // 16
     scratch = torch.empty(sum(zones) * slab, dtype=torch.uint8, device=data.device)
+    if bits == 4:
+        # Build the decode table now: prefill runs the chunked path, so the first MMA
+        # decode can already be under graph capture, where the table's host copy fails.
+        _w4a8_fixed_decode_lut(data.device)
     _C.pack_w4a8_mma_inplace(
         _wrap_for_dlpack(data), _wrap_for_dlpack(scales), _wrap_for_dlpack(scratch),
         offsets, rows, zones, bits, torch.cuda.current_stream(data.device).cuda_stream,

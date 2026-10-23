@@ -273,6 +273,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 constexpr int kStreamStages = 4;
 constexpr int kMmaWarps = 8;
 constexpr int kCreditRecords = 8;   // records between ring credits; rows is a multiple
+constexpr int64_t kPdlPrefetchBytes = 3584 << 10;
 
 template <int BITS> struct StreamRecord {
     static constexpr int kBytes = 512 * BITS / 8 + 32;
@@ -300,7 +301,7 @@ void w4a8_codebook_mma_stream_kernel(
     int* __restrict__ workspace,
     int* __restrict__ counters,
     OutputT* __restrict__ output,
-    int M, int N, int K, int rows)
+    int M, int N, int K, int rows, int pre_stages)
 {
     constexpr int S = kStreamStages;
     constexpr int R = StreamRecord<BITS>::kBytes;
@@ -343,14 +344,27 @@ void w4a8_codebook_mma_stream_kernel(
 
     #pragma unroll
     for (int s = 0; s < S; ++s) {
-        if (issuer) cp_async16(st_s + s * R, record(s));
-        cp_async_commit();
+        if (s < pre_stages) {
+            if (issuer) cp_async16(st_s + s * R, record(s));
+            cp_async_commit();
+        }
     }
     for (int i = threadIdx.x; i < 256; i += kMmaWarps * 32) {
         if constexpr (BITS == 4) {
             lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
         } else {
             scale_table[i] = load_scale<uint8_t>(static_cast<uint8_t>(i));
+        }
+    }
+    // PDL: everything above reads only weights; x, xs and the workspace follow the quantizer
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    #pragma unroll
+    for (int s = 0; s < S; ++s) {
+        if (s >= pre_stages) {
+            if (issuer) cp_async16(st_s + s * R, record(s));
+            cp_async_commit();
         }
     }
     for (int i = threadIdx.x; i < 8 * rows * 2; i += kMmaWarps * 32) {
@@ -753,9 +767,22 @@ extern "C" bool launch_w4a8_codebook_mma(
         const dim3 grid(
             static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
             static_cast<unsigned int>(splits));
+        // Stages prefetched while the quantizer still runs: about what DRAM delivers in
+        // its ~2 us. Past that the flood queues the quantizer's own traffic and delays the wait.
+        const int64_t stage_bytes = static_cast<int64_t>(grid.x) * grid.y * kMmaWarps * StreamRecord<BITS>::kBytes;
+        const int pre_stages = static_cast<int>(std::min<int64_t>(kStreamStages, kPdlPrefetchBytes / stage_bytes));
         DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
-            w4a8_codebook_mma_stream_kernel<OutputT, BITS>
-                <<<grid, kMmaWarps * 32, w4a8_stream_smem_bytes<BITS>(rows), stream>>>(
+            cudaLaunchAttribute attr;
+            attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr.val.programmaticStreamSerializationAllowed = compute_capability_major >= 9;
+            cudaLaunchConfig_t config = {};
+            config.gridDim = grid;
+            config.blockDim = dim3(kMmaWarps * 32);
+            config.dynamicSmemBytes = w4a8_stream_smem_bytes<BITS>(rows);
+            config.stream = stream;
+            config.attrs = &attr;
+            config.numAttrs = 1;
+            cudaLaunchKernelEx(&config, w4a8_codebook_mma_stream_kernel<OutputT, BITS>,
                 static_cast<const int8_t*>(xq),
                 static_cast<const int8_t*>(weight),
                 static_cast<const int8_t*>(decode_lut),
@@ -767,7 +794,7 @@ extern "C" bool launch_w4a8_codebook_mma(
                 static_cast<int*>(workspace),
                 static_cast<int*>(counters),
                 static_cast<OutputT*>(out),
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows);
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows, pre_stages);
         });
     };
     if (bits == 4) launch.template operator()<4>();

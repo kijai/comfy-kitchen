@@ -1719,9 +1719,15 @@ template<typename InputType, int CL, int ACT>
 __global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
 quantize_int8_convrot_cluster_kernel(
     const InputType* x, const InputType* act_weight, float act_eps,
-    int8_t* q, float* scales, int K)
+    int8_t* q, float* scales, int K, int* __restrict__ zero, int64_t zero_count)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // let the PDL-launched W4A8 MMA start its weight prefetch now; it waits for our results
+    asm volatile("griddepcontrol.launch_dependents;");
+    // the MMA's split-K workspace + counters: it touches them only after we complete
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * kClusterQuantThreads + threadIdx.x; i < zero_count;
+         i += static_cast<int64_t>(gridDim.x) * kClusterQuantThreads)
+        zero[i] = 0;
     quantize_int8_convrot_blocks<InputType, CL, ACT, false>(x, act_weight, act_eps, q, scales, K, nullptr);
 #endif
 }
@@ -2042,6 +2048,8 @@ bool launch_quantize_int8_convrot_cluster_kernel(
     int64_t num_rows,
     int64_t num_cols,
     int input_dtype_code,
+    void* zero,
+    int64_t zero_count,
     cudaStream_t stream)
 {
     using namespace comfy;
@@ -2076,7 +2084,9 @@ bool launch_quantize_int8_convrot_cluster_kernel(
                     act_eps,
                     static_cast<int8_t*>(output),
                     static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+                    static_cast<int>(num_cols),
+                    static_cast<int*>(zero),
+                    zero_count);
         };
         auto launch_cl = [&]<int CL>() {
             switch (act_code) {

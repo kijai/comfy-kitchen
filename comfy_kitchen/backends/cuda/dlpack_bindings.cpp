@@ -2624,6 +2624,8 @@ extern "C" {
         int64_t num_rows,
         int64_t num_cols,
         int input_dtype_code,
+        void* zero,
+        int64_t zero_count,
         cudaStream_t stream);
 
     bool launch_quantize_int8_convrot_cooperative_kernel(
@@ -3808,10 +3810,22 @@ bool w4a8_codebook_mma_linear(
         throw std::runtime_error("w4a8_codebook_mma_linear input must be fp32, fp16, or bf16");
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (!launch_quantize_int8_convrot_cluster_kernel(
+    // The MMA needs its workspace and counters zero on entry. The cluster quantizer clears
+    // them when they are one contiguous range (the Python scratch); otherwise memset here.
+    int32_t* ws = static_cast<int32_t*>(workspace.data());
+    const bool one_range = static_cast<int32_t*>(counters.data()) == ws + M * N;
+    if (!one_range) {
+        cudaMemsetAsync(workspace.data(), 0, M * N * sizeof(int32_t), stream);
+        cudaMemsetAsync(counters.data(), 0, N / 16 * sizeof(int32_t), stream);
+    }
+    const bool cluster = launch_quantize_int8_convrot_cluster_kernel(
             input.data(), has_act_weight ? act_weight->data() : nullptr,
             static_cast<float>(act_eps), static_cast<int>(act_code),
-            xq.data(), xs.data(), M, K, input_dtype_code, stream)
+            xq.data(), xs.data(), M, K, input_dtype_code,
+            one_range ? ws : nullptr, one_range ? M * N + N / 16 : 0, stream);
+    if (!cluster && one_range)
+        cudaMemsetAsync(ws, 0, (M * N + N / 16) * sizeof(int32_t), stream);
+    if (!cluster
             && !(bits == 4 && convrot_group_size == 256 && partial_absmax.has_value()
                 && launch_quantize_int8_convrot_cooperative_kernel(
                     input.data(), has_act_weight ? act_weight->data() : nullptr,
